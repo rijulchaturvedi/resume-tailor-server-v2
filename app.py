@@ -18,12 +18,14 @@ app.logger.setLevel(logging.INFO)
 # ----------------------------
 # Model / OpenAI settings
 # ----------------------------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # your chosen model name
+# Default to a fast, reliable model; override with OPENAI_MODEL=gpt-5 if desired.
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").lower() in ("1", "true", "yes")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").lower() not in ("0", "false", "no")
-OAI_BUDGET = float(os.getenv("OAI_BUDGET", "12"))  # seconds hard wall
+OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))            # hard wall (seconds) for each model call
+OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20.0"))  # SDK client timeout (seconds)
 
 try:
     from openai import OpenAI
@@ -50,8 +52,8 @@ def _get_client():
     if not OPENAI_API_KEY or not _openai_available or not OAI_ENABLED:
         return None
     try:
-        client_timeout = float(os.getenv("OAI_CLIENT_TIMEOUT", "12.0"))
-        return OpenAI(api_key=OPENAI_API_KEY, timeout=client_timeout, max_retries=0)
+        # Fail fast; outer thread guard enforces a hard wall too
+        return OpenAI(api_key=OPENAI_API_KEY, timeout=OAI_CLIENT_TIMEOUT, max_retries=0)
     except Exception as e:
         app.logger.exception("OpenAI client init failed: %s", e)
         return None
@@ -68,7 +70,9 @@ def _gpt_call_chat(client, system, prompt) -> str:
     return resp.choices[0].message.content.strip()
 
 def _gpt_call_resp(client, system, prompt) -> str:
-    # Optional: Responses API path
+    # Optional: Responses API path (only if SDK supports it)
+    if not hasattr(client, "responses"):
+        raise AttributeError("Responses API not available in this SDK")
     resp = client.responses.create(
         model=MODEL,
         input=[{"role": "system", "content": system},
@@ -91,7 +95,7 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
     if client is None:
         return "Placeholder output (model disabled or key missing)."
     try:
-        if USE_RESPONSES_API:
+        if USE_RESPONSES_API and hasattr(client, "responses"):
             return EXECUTOR.submit(_gpt_call_resp, client, system, prompt).result(timeout=OAI_BUDGET)
         return EXECUTOR.submit(_gpt_call_chat, client, system, prompt).result(timeout=OAI_BUDGET)
     except FuturesTimeout:
@@ -118,21 +122,29 @@ def ensure_docx(doc_or_bytes):
     except Exception as e:
         raise RuntimeError(f"Failed to open DOCX: {e}")
 
+# Normalize headings and detect sections
+def _norm_heading(text: str) -> str:
+    t = sanitize(text).upper()
+    t = t.replace("&", "AND")
+    t = re.sub(r"[^A-Z0-9 ]+", " ", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
 KNOWN_HEADINGS = {
     "PROFESSIONAL SUMMARY","SUMMARY","EXPERIENCE","WORK EXPERIENCE",
-    "SKILLS","CORE SKILLS","TECHNICAL SKILLS","EDUCATION","PROJECTS",
-    "CERTIFICATIONS","PUBLICATIONS","ACHIEVEMENTS"
+    "SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS AND TOOLS","EDUCATION",
+    "PROJECTS","CERTIFICATIONS","PUBLICATIONS","ACHIEVEMENTS"
 }
 
 def is_heading(text: str) -> bool:
-    t = sanitize(text)
-    return (not t) or t.isupper() or (t.upper() in KNOWN_HEADINGS)
+    t = _norm_heading(text)
+    return (not t) or t in KNOWN_HEADINGS or t.isupper()
 
 def find_section_bounds(doc: Document, titles: List[str]) -> Optional[Tuple[int, int]]:
-    titles_up = {t.upper() for t in titles}
+    titles_up = {_norm_heading(t) for t in titles}
     start = None
     for i, p in enumerate(doc.paragraphs):
-        if sanitize(p.text).upper() in titles_up:
+        if _norm_heading(p.text) in titles_up:
             start = i
             break
     if start is None:
@@ -152,8 +164,7 @@ def delete_range(doc: Document, start: int, end: int):
 def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional[str] = None) -> Paragraph:
     """
     Inserts a paragraph immediately after `paragraph`.
-    If `style` is provided but missing in the document, fall back to plain
-    paragraph and prefix a bullet if we intended a bullet style.
+    If `style` is missing in the template, fall back to a plain paragraph and prepend "• " if it was a bullet style.
     """
     new_p = OxmlElement("w:p")
     paragraph._p.addnext(new_p)
@@ -167,12 +178,9 @@ def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional
         try:
             new_para.style = style
         except KeyError:
-            # Style doesn't exist in this template; if it was a bullet style,
-            # add a visible bullet prefix as a graceful fallback.
-            if run and style.lower().startswith("list"):
+            if run and style.lower().startswith("list"):  # e.g., "List Bullet"
                 if not run.text.strip().startswith("•"):
                     run.text = f"• {run.text}"
-            # else: silently keep default style
 
     return new_para
 
@@ -193,7 +201,7 @@ def write_summary(doc: Document, summary: str):
         doc.add_paragraph(sanitize(summary))
 
 def inject_skills(doc: Document, skills_map: Dict[str, list]):
-    sec = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS"])
+    sec = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"])
     if sec:
         s, e = sec
         if e >= s + 1:
@@ -201,7 +209,7 @@ def inject_skills(doc: Document, skills_map: Dict[str, list]):
         anchor = doc.paragraphs[s]
     else:
         anchor = doc.add_paragraph()
-        anchor.add_run("SKILLS").bold = True
+        anchor.add_run("SKILLS & TOOLS").bold = True
 
     last = anchor
     for cat, arr in skills_map.items():
@@ -241,15 +249,57 @@ def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
         anchor = doc.paragraphs[i]
         last = anchor
         for b in bullets_by_company.get(match_comp, []):
-            last = insert_paragraph_after(last, sanitize(b), style="List Bullet")  # safe fallback inside
+            last = insert_paragraph_after(last, sanitize(b), style="List Bullet")  # falls back safely
 
         # Advance past newly added bullets
         i = i + 1 + len(bullets_by_company.get(match_comp, []))
 
 # ----------------------------
+# Skills heuristic (JD-driven)
+# ----------------------------
+SKILL_BANK = {
+    "Business Analysis & Delivery": [
+        "Requirements elicitation", "User stories", "Acceptance criteria", "UAT", "BPMN", "UML",
+        "Process re-engineering", "Traceability (RTM)", "Fit–gap", "Prioritization (RICE, MoSCoW)"
+    ],
+    "Project & Program Management": [
+        "Agile Scrum", "Kanban", "SDLC", "RACI", "RAID", "Sprint planning", "Roadmapping", "Stakeholder management"
+    ],
+    "Data, Analytics & BI": [
+        "SQL", "Python", "Pandas", "NumPy", "Power BI", "Tableau", "A/B testing", "Forecasting", "Anomaly detection"
+    ],
+    "Cloud, Data & MLOps": [
+        "AWS Lambda", "S3", "Redshift", "Airflow", "dbt", "Spark", "Databricks", "ETL/ELT orchestration"
+    ],
+    "AI, ML & GenAI": [
+        "LLMs", "RAG", "Prompt design", "Hugging Face", "FAISS", "Model monitoring", "Inference optimization"
+    ],
+    "Enterprise Platforms & Integration": [
+        "Salesforce", "NetSuite", "SAP", "ServiceNow", "REST APIs", "Postman", "Git", "Azure DevOps", "Jira"
+    ],
+    "Collaboration, Design & Stakeholder": [
+        "Miro", "Figma", "Lucidchart", "Wireframing", "Prototyping", "Executive communication", "Workshops"
+    ],
+}
+
+def pick_skills(jd: str, bank: Dict[str, List[str]], top_k: int = 8) -> Dict[str, List[str]]:
+    jd_l = jd.lower()
+    out = {}
+    for cat, items in bank.items():
+        hits = []
+        for s in items:
+            pat = re.escape(s.lower()).replace(r"\ ", r"\s+")
+            if re.search(rf"(?<![A-Za-z0-9]){pat}(?![A-Za-z0-9])", jd_l):
+                hits.append(s)
+        seen = set()
+        merged = [x for x in hits + items if (x not in seen and not seen.add(x))]
+        out[cat] = merged[:top_k]
+    return out
+
+# ----------------------------
 # Batch bullets (1 model call)
 # ----------------------------
-def gpt_bullets_batch(experience: list[dict], jd: str, style_rules: list[str]) -> dict[str, list[str]]:
+def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str]) -> Dict[str, List[str]]:
     """
     Single OpenAI call that returns bullets for ALL companies as pure JSON:
     { "<company>": ["bullet1","bullet2", ...], ... }
@@ -268,7 +318,7 @@ def gpt_bullets_batch(experience: list[dict], jd: str, style_rules: list[str]) -
 
     rules_txt = (
         "\n".join(f"- {r}" for r in style_rules) if style_rules else
-        "- Plain, specific tone\n- 20–28 words each\n- Metricize when truthful\n- Do not include company names inside bullets"
+        "- 20–28 words each\n- Start with strong verb; past tense\n- Include 1 truthful metric (%, $, time)\n- No company names inside bullets\n- Avoid buzzwords; focus on actions and outcomes"
     )
 
     prompt = f"""Return ONLY JSON (no code fences) mapping company name to an array of bullet strings.
@@ -278,9 +328,9 @@ Entries:
 Rules:
 {rules_txt}
 
-Job description:
+Job description (trimmed):
 ---
-{jd[:4000]}
+{jd[:1500]}
 ---
 
 JSON schema example:
@@ -325,7 +375,8 @@ def index():
 
 @app.route("/health")
 def health():
-    return jsonify({"ok": True, "model": MODEL})
+    enabled = bool(OPENAI_API_KEY) and OAI_ENABLED
+    return jsonify({"ok": True, "model": MODEL, "openai_enabled": enabled})
 
 @app.route("/tailor", methods=["POST", "OPTIONS"])
 def tailor():
@@ -368,18 +419,17 @@ def tailor():
 
     # --- Generate content (OpenAI or placeholders)
     summary_prompt = (
-        f"Write {summary_sentences} sentence professional summary aligned to this job description. "
-        f"Plain, specific tone; no em/en dashes.\n---\n{job_desc[:4000]}"
+        f"Write {summary_sentences} sentence professional summary aligned to the job description below. "
+        f"Use concise, specific language; avoid buzzwords and dashes; highlight quantified impact if truthful.\n---\n{job_desc[:1500]}"
     )
     summary = sanitize(gpt(summary_prompt))
 
     # Batch bullets in one model call to avoid timeouts
-    bullets_by_company: Dict[str, list] = gpt_bullets_batch(experience, job_desc, style_rules)
+    bullets_by_company: Dict[str, List[str]] = gpt_bullets_batch(experience, job_desc, style_rules)
 
-    # Skills grouping (simple; backend enforces categories)
-    skills_map = {c: [] for c in skills_categories}
-    if skills_categories:
-        skills_map[skills_categories[0]] = ["SQL", "Python", "Power BI", "Stakeholder management"]
+    # Skills grouping (JD-driven, per category)
+    desired_bank = {c: SKILL_BANK.get(c, []) for c in skills_categories}
+    skills_map = pick_skills(job_desc, desired_bank) if skills_categories else {}
 
     # --- Edit DOCX
     doc = base_doc
