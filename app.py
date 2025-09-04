@@ -74,20 +74,16 @@ def _gpt_call_resp(client, system, prompt) -> str:
         input=[{"role": "system", "content": system},
                {"role": "user", "content": prompt}],
     )
-    # Best-effort output extraction across SDK variants
     if hasattr(resp, "output_text"):
         return str(resp.output_text).strip()
     if hasattr(resp, "output") and resp.output:
-        # concatenate textual outputs
         parts = []
         for item in resp.output:
-            # newer SDK often presents text via item.content[0].text
             content = getattr(item, "content", [])
             if content and hasattr(content[0], "text"):
                 parts.append(content[0].text)
         if parts:
             return sanitize(" ".join(parts))
-    # Fallback to string
     return sanitize(str(resp))
 
 def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> str:
@@ -95,7 +91,6 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
     if client is None:
         return "Placeholder output (model disabled or key missing)."
     try:
-        # hard stop even if SDK/httpx misbehave
         if USE_RESPONSES_API:
             return EXECUTOR.submit(_gpt_call_resp, client, system, prompt).result(timeout=OAI_BUDGET)
         return EXECUTOR.submit(_gpt_call_chat, client, system, prompt).result(timeout=OAI_BUDGET)
@@ -235,6 +230,76 @@ def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
         i = i + 1 + len(bullets_by_company.get(match_comp, []))
 
 # ----------------------------
+# Batch bullets (1 model call)
+# ----------------------------
+def gpt_bullets_batch(experience: list[dict], jd: str, style_rules: list[str]) -> dict[str, list[str]]:
+    """
+    Single OpenAI call that returns bullets for ALL companies as pure JSON:
+    { "<company>": ["bullet1","bullet2", ...], ... }
+    Falls back to placeholders on error/timeout.
+    """
+    entries = []
+    for e in experience:
+        k = int(e.get("bullets", 0) or 0)
+        if k <= 0:
+            continue
+        comp = sanitize(e.get("company", ""))
+        role = sanitize(e.get("role", ""))
+        entries.append(f'- company: "{comp}"; role: "{role}"; bullets: {k}')
+    if not entries:
+        return {sanitize(e.get("company","")): [] for e in experience}
+
+    rules_txt = (
+        "\n".join(f"- {r}" for r in style_rules) if style_rules else
+        "- Plain, specific tone\n- 20–28 words each\n- Metricize when truthful\n- Do not include company names inside bullets"
+    )
+
+    prompt = f"""Return ONLY JSON (no code fences) mapping company name to an array of bullet strings.
+Entries:
+{chr(10).join(entries)}
+
+Rules:
+{rules_txt}
+
+Job description:
+---
+{jd[:4000]}
+---
+
+JSON schema example:
+{{
+  "Company A": ["bullet 1", "bullet 2"],
+  "Company B": ["bullet 1", "bullet 2", "bullet 3"]
+}}"""
+
+    text = gpt(prompt, system="You produce strict JSON only. No commentary.")
+    # Try parse; if it fails, build placeholders
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = {}
+        for e in experience:
+            comp = sanitize(e.get("company",""))
+            k = int(e.get("bullets", 0) or 0)
+            role = sanitize(e.get("role",""))
+            if k > 0:
+                data[comp] = [
+                    f"Delivered outcomes aligned with role '{role}', applying relevant skills; results tailored to the job description. (placeholder)"
+                    for _ in range(k)
+                ]
+            else:
+                data[comp] = []
+
+    # Normalize counts + sanitize
+    out = {}
+    for e in experience:
+        comp = sanitize(e.get("company",""))
+        k = int(e.get("bullets", 0) or 0)
+        bullets = [sanitize(b) for b in (data.get(comp) or [])][:k]
+        out[comp] = bullets
+    return out
+
+# ----------------------------
 # Routes
 # ----------------------------
 @app.route("/")
@@ -291,32 +356,12 @@ def tailor():
     )
     summary = sanitize(gpt(summary_prompt))
 
-    bullets_by_company: Dict[str, list] = {}
-    for e in experience:
-        comp = e.get("company", "")
-        role = e.get("role", "")
-        k = int(e.get("bullets", 0))
-        if k <= 0:
-            bullets_by_company[comp] = []
-            continue
-        bp = (
-            f"Write exactly {k} resume bullets for role '{role}'. "
-            f"Each 20–28 words, specific, metricized when truthful. "
-            f"Do not include company names inside bullets.\nAligned to JD:\n---\n{job_desc[:4000]}"
-        )
-        raw = gpt(bp)
-        # split lines, strip numbering like "1. "
-        parts = [sanitize(x) for x in re.split(r"[\n\r]+", raw) if sanitize(x)]
-        clean = []
-        for t in parts:
-            m = re.match(r"^\s*(\d+)[\.\)]\s+(.*)$", t)
-            clean.append(m.group(2) if m else t)
-        bullets_by_company[comp] = clean[:k]
+    # Batch bullets in one model call to avoid timeouts
+    bullets_by_company: Dict[str, list] = gpt_bullets_batch(experience, job_desc, style_rules)
 
     # Skills grouping (simple; backend enforces categories)
     skills_map = {c: [] for c in skills_categories}
     if skills_categories:
-        # provide a non-empty example in the first bucket
         skills_map[skills_categories[0]] = ["SQL", "Python", "Power BI", "Stakeholder management"]
 
     # --- Edit DOCX
