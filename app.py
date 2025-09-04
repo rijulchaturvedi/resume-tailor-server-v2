@@ -8,24 +8,23 @@ from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 # ----------------------------
-# App & CORS (mirrors original)
+# App & CORS (Chrome extension → /tailor)
 # ----------------------------
 app = Flask(__name__)
-# Allow chrome extension origins to hit /tailor (OPTIONS + POST)
 CORS(app, resources={r"/tailor": {"origins": "chrome-extension://*"}})
 app.logger.setLevel(logging.INFO)
 
 # ----------------------------
 # Model / OpenAI settings
 # ----------------------------
-# Default to a fast, reliable model; override with OPENAI_MODEL=gpt-5 if desired.
+# Default to a fast/reliable model; override with OPENAI_MODEL=gpt-5 if you like.
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").lower() in ("1", "true", "yes")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").lower() not in ("0", "false", "no")
-OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))                 # hard wall (seconds) per model call
-OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20")) # SDK client timeout
+OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))                 # hard wall (s) per call
+OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20")) # SDK client timeout (s)
 
 try:
     from openai import OpenAI
@@ -34,7 +33,7 @@ except Exception:
     _openai_available = False
 
 # ----------------------------
-# Text utils
+# Text & heading utils
 # ----------------------------
 def sanitize(text: str) -> str:
     if not text:
@@ -45,7 +44,6 @@ def sanitize(text: str) -> str:
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
-# Normalize headings for detection
 def _norm_heading(text: str) -> str:
     t = sanitize(text).upper()
     t = t.replace("&", "AND")
@@ -86,29 +84,43 @@ def delete_range(doc: Document, start: int, end: int):
 
 def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional[str] = None) -> Paragraph:
     """
-    Inserts a paragraph immediately after `paragraph`.
-    If `style` is missing in the template, fall back to a plain paragraph and prepend "• " if it was a bullet style.
+    Insert a paragraph immediately after `paragraph`.
+    If `style` doesn't exist, fall back to normal text and prepend "• " for bullet styles.
     """
     new_p = OxmlElement("w:p")
     paragraph._p.addnext(new_p)
     new_para = Paragraph(new_p, paragraph._parent)
-
     run = None
     if text:
         run = new_para.add_run(text)
-
     if style:
         try:
             new_para.style = style
         except KeyError:
-            if run and style.lower().startswith("list"):  # e.g., "List Bullet"
+            if run and style.lower().startswith("list"):
                 if not run.text.strip().startswith("•"):
                     run.text = f"• {run.text}"
-
     return new_para
 
 # ----------------------------
-# Bullet helpers (quant + detection)
+# DOCX load helper
+# ----------------------------
+def ensure_docx(doc_or_bytes):
+    """Accept a python-docx Document, a file-like, or raw bytes; return a Document."""
+    try:
+        if hasattr(doc_or_bytes, "paragraphs"):
+            return doc_or_bytes
+        if hasattr(doc_or_bytes, "read"):
+            data = doc_or_bytes.read()
+        else:
+            data = doc_or_bytes
+        bio = io.BytesIO(data)
+        return Document(bio)
+    except Exception as e:
+        raise RuntimeError(f"Failed to open DOCX: {e}")
+
+# ----------------------------
+# Bullet helpers (quantification & detection)
 # ----------------------------
 QUANT_REGEX = re.compile(
     r"(\d|\$|%|\bhrs?\b|\bhour(s)?\b|\bday(s)?\b|\bweek(s)?\b|\bmonth(s)?\b|\byear(s)?\b|\b\d{1,3}k\b)",
@@ -149,14 +161,12 @@ def _get_client():
     if not OPENAI_API_KEY or not _openai_available or not OAI_ENABLED:
         return None
     try:
-        # Fail fast; outer thread guard enforces a hard wall too
         return OpenAI(api_key=OPENAI_API_KEY, timeout=OAI_CLIENT_TIMEOUT, max_retries=0)
     except Exception as e:
         app.logger.exception("OpenAI client init failed: %s", e)
         return None
 
 def _gpt_call_chat(client, system, prompt) -> str:
-    # Do not set temperature; some models accept only default
     resp = client.chat.completions.create(
         model=MODEL,
         messages=[
@@ -167,7 +177,6 @@ def _gpt_call_chat(client, system, prompt) -> str:
     return resp.choices[0].message.content.strip()
 
 def _gpt_call_resp(client, system, prompt) -> str:
-    # Optional: Responses API path (only if SDK supports it)
     if not hasattr(client, "responses"):
         raise AttributeError("Responses API not available in this SDK")
     resp = client.responses.create(
@@ -203,7 +212,7 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
         return "Placeholder output due to model error."
 
 # ----------------------------
-# DOCX writers
+# DOCX section writers
 # ----------------------------
 def write_summary(doc: Document, summary: str):
     sec = find_section_bounds(doc, ["PROFESSIONAL SUMMARY", "SUMMARY"])
@@ -213,14 +222,13 @@ def write_summary(doc: Document, summary: str):
             delete_range(doc, s + 1, e)
         insert_paragraph_after(doc.paragraphs[s], sanitize(summary))
     else:
-        # Append a new section at the end
         heading = doc.add_paragraph()
         heading.add_run("PROFESSIONAL SUMMARY").bold = True
         doc.add_paragraph(sanitize(summary))
 
 def inject_skills(doc: Document, new_skills: Dict[str, list]):
     """
-    Keep existing skills content, append new items per category (dedup).
+    Keep existing skills content; append new items per category (dedup).
     If section doesn't exist, create SKILLS & TOOLS. Categories are lines ending with ":".
     """
     if not new_skills:
@@ -233,14 +241,14 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
         sec = find_section_bounds(doc, ["SKILLS & TOOLS", "SKILLS AND TOOLS"])
     s, e = sec
 
-    # Parse existing categories and their item lines between s+1..e
-    existing_map: Dict[str, Tuple[int, set]] = {}  # cat -> (paragraph_index_for_items, set(items))
+    # Parse existing categories and item lines between s+1..e
+    existing_map: Dict[str, Tuple[int, set]] = {}
     current_cat = None
     for idx in range(s + 1, e + 1):
         line = sanitize(doc.paragraphs[idx].text)
         if not line:
             continue
-        if line.endswith(":"):  # category header
+        if line.endswith(":"):
             current_cat = line[:-1].strip()
             existing_map.setdefault(current_cat, (None, set()))
         else:
@@ -250,7 +258,7 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
                 aset.update(items)
                 existing_map[current_cat] = (idx, aset)
 
-    # Append or create categories (dedupe)
+    # Append or create categories
     for cat, additions in new_skills.items():
         additions = [x for x in additions if x]
         if not additions:
@@ -279,7 +287,7 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
                 newp = insert_paragraph_after(anchor, ", ".join(to_add))
                 existing_map[cat] = (doc.paragraphs.index(newp), set(to_add))
         else:
-            # New category → append header + items at the end of the section
+            # New category → append header + items at end of the section
             sec = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"])
             s, e = sec
             anchor = doc.paragraphs[e]
@@ -391,7 +399,7 @@ def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str]) -
         "- 20–28 words each\n"
         "- Start with a strong verb; past tense\n"
         "- Include at least one quantifier when truthful (%, $, #, time, count); prefer real figures from the JD\n"
-        "- If no truthful figure exists, mark the slot with a neutral phrase like 'KPI TBD' instead of inventing numbers\n"
+        "- If no truthful figure exists, mark with 'KPI TBD' instead of inventing numbers\n"
         "- No company names inside bullets\n"
         "- Avoid buzzwords; focus on actions and outcomes"
     )
@@ -415,7 +423,7 @@ JSON schema example:
 }}"""
 
     text = gpt(prompt, system="You produce strict JSON only. No commentary.")
-    # Try parse; if it fails, build placeholders
+    # Try parse; if fail, build placeholders
     try:
         data = json.loads(text)
     except Exception:
@@ -426,13 +434,13 @@ JSON schema example:
             role = sanitize(e.get("role",""))
             data[comp] = [f"Delivered outcomes in '{role}' aligned to the JD (KPI TBD)" for _ in range(max(k,0))]
 
-    # Normalize counts + sanitize + ensure quant signal present
+    # Normalize counts + sanitize + ensure quant signal
     out = {}
     for e in experience:
         comp = sanitize(e.get("company",""))
         k = int(e.get("bullets", 0) or 0)
         bullets = [sanitize(b) for b in (data.get(comp) or [])][:k]
-        bullets = ensure_quantified(bullets)  # add KPI marker if no quantifier present
+        bullets = ensure_quantified(bullets)
         out[comp] = bullets
     return out
 
@@ -450,10 +458,9 @@ def health():
 
 @app.route("/tailor", methods=["POST", "OPTIONS"])
 def tailor():
-    # CORS preflight handled by Flask-CORS
     origin = request.headers.get("Origin", "*")
 
-    # Accept either JSON body (original flow) or multipart (v2 flow)
+    # JSON or multipart payloads
     if request.content_type and "multipart/form-data" in request.content_type.lower():
         base_resume_file = request.files.get("base_resume")
         payload_part = request.form.get("payload")
@@ -487,25 +494,23 @@ def tailor():
         with open(base_path, "rb") as f:
             base_doc = ensure_docx(f)
 
-    # --- Generate content (OpenAI or placeholders)
+    # --- Generate content
     summary_prompt = (
         f"Write {summary_sentences} sentence professional summary aligned to the job description below. "
         f"Use concise, specific language; prefer quantified outcomes when truthful; avoid buzzwords and dashes.\n---\n{job_desc[:1500]}"
     )
     summary = sanitize(gpt(summary_prompt))
 
-    # Batch bullets in one model call (quantified)
     bullets_by_company: Dict[str, List[str]] = gpt_bullets_batch(experience, job_desc, style_rules)
 
-    # Skills grouping (JD-driven, per category) — keep existing + append deduped
     desired_bank = {c: SKILL_BANK.get(c, []) for c in skills_categories}
     skills_map = pick_skills(job_desc, desired_bank) if skills_categories else {}
 
     # --- Edit DOCX
     doc = base_doc
     write_summary(doc, summary)
-    inject_skills(doc, skills_map)          # keep originals; append new (dedupe)
-    inject_bullets(doc, bullets_by_company) # replace existing bullet block; no stacking
+    inject_skills(doc, skills_map)          # keep originals; append deduped
+    inject_bullets(doc, bullets_by_company) # replace bullet block only
 
     # --- Return DOCX
     out = io.BytesIO()
@@ -521,7 +526,6 @@ def tailor():
             download_name=filename,
         )
     )
-    # Echo origin explicitly (Flask-CORS also handles this, but mirrors original behavior)
     resp.headers["Access-Control-Allow-Origin"] = origin
     resp.headers["Vary"] = "Origin"
     return resp
