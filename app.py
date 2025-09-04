@@ -3,14 +3,17 @@ from flask_cors import CORS
 from docx import Document
 import io, os, json, re, logging
 from typing import List, Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 app = Flask(__name__)
 # Match original: allow chrome-extension origins to hit /tailor (OPTIONS + POST)
 CORS(app, resources={r"/tailor": {"origins": "chrome-extension://*"}})
 app.logger.setLevel(logging.INFO)
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
+OAI_ENABLED = os.getenv("USE_OPENAI", "1").lower() not in ("0", "false", "no")
 
 try:
     from openai import OpenAI
@@ -27,31 +30,38 @@ def sanitize(text: str) -> str:
     return text.strip()
 
 def _get_client():
-    if not OPENAI_API_KEY or not _openai_available:
+    if not OPENAI_API_KEY or not _openai_available or not OAI_ENABLED:
         return None
     try:
-        # hard wall for the whole request; also cap retries
-        return OpenAI(api_key=OPENAI_API_KEY, timeout=15.0, max_retries=1)
+        # hard wall; retries off so we fail fast
+        return OpenAI(api_key=OPENAI_API_KEY, timeout=12.0, max_retries=0)
     except Exception as e:
         app.logger.exception("OpenAI client init failed: %s", e)
         return None
 
+def _gpt_call(client, system, prompt):
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": prompt}],
+        # do not set temperature; some models only allow default
+    )
+    return resp.choices[0].message.content.strip()
+
 def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> str:
     client = _get_client()
     if client is None:
-        return "Placeholder output (no OPENAI_API_KEY set)."
-    # Do NOT set temperature (some models reject non-default)
+        return "Placeholder output (model disabled or key missing)."
     try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": prompt}],
-            timeout=15.0,  # per-call guard (in addition to client timeout)
-        )
-        return resp.choices[0].message.content.strip()
+        # hard stop even if SDK/httpx misbehave
+        budget = float(os.getenv("OAI_BUDGET", "12"))
+        return EXECUTOR.submit(_gpt_call, client, system, prompt).result(timeout=budget)
+    except FuturesTimeout:
+        app.logger.warning("OpenAI call timed out; returning placeholder.")
+        return "Placeholder output due to timeout."
     except Exception as e:
-        app.logger.warning("OpenAI call failed; using placeholder: %s", e)
-        return "Placeholder output due to model timeout/error."
+        app.logger.warning("OpenAI error; returning placeholder: %s", e)
+        return "Placeholder output due to model error."
 
 def ensure_docx(doc_or_bytes):
     """Accept a python-docx Document, a file-like object, or raw bytes and return a Document."""
