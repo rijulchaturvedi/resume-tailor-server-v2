@@ -41,11 +41,21 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
     )
     return resp.choices[0].message.content.strip()
 
-def ensure_docx(doc_or_bytes) -> Document:
-    if isinstance(doc_or_bytes, Document):
-        return doc_or_bytes
-    bio = io.BytesIO(doc_or_bytes.read() if hasattr(doc_or_bytes, 'read') else doc_or_bytes)
-    return Document(bio)
+def ensure_docx(doc_or_bytes):
+    """Accept a python-docx Document, a file-like object, or raw bytes and return a Document."""
+    try:
+        # If it behaves like a python-docx Document (has paragraphs), use it
+        if hasattr(doc_or_bytes, "paragraphs"):
+            return doc_or_bytes
+        # If it's a Werkzeug/FileStorage or any file-like, read bytes
+        if hasattr(doc_or_bytes, "read"):
+            data = doc_or_bytes.read()
+        else:
+            data = doc_or_bytes
+        bio = io.BytesIO(data)
+        return Document(bio)
+    except Exception as e:
+        raise RuntimeError(f"Failed to open DOCX: {e}")
 
 def write_summary(doc: Document, summary: str):
     # simple heuristic: replace first non-empty paragraph under SUMMARY/PROFESSIONAL SUMMARY if found, else prepend
