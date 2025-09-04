@@ -7,24 +7,30 @@ import io, os, json, re, logging
 from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
+# ----------------------------
+# App & CORS (Chrome extension → /tailor)
+# ----------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/tailor": {"origins": "chrome-extension://*"}})
 app.logger.setLevel(logging.INFO)
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# ----------------------------
+# Model / OpenAI settings
+# ----------------------------
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # or "gpt-5"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").strip().lower() in ("1","true","yes")
-EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS","2")))
-OAI_ENABLED = os.getenv("USE_OPENAI","1").strip().lower() not in ("0","false","no")
-OAI_BUDGET = float(os.getenv("OAI_BUDGET","20"))
-OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT","20"))
+USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").strip().lower() in ("1", "true", "yes")
+EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
+OAI_ENABLED = os.getenv("USE_OPENAI", "1").strip().lower() not in ("0", "false", "no")
+OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))
+OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20"))
 
 def _env_bool(name: str, default: bool=False) -> bool:
     v = os.getenv(name)
     if v is None: return default
     return v.strip().lower() in ("1","true","yes","y","on")
 
-# toggles (also re-read per request)
+# Per-request toggles (also read from JSON)
 SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
 BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", False)
 
@@ -35,17 +41,17 @@ except Exception:
     _openai_available = False
 
 # ----------------------------
-# text utils / headings
+# Text / headings utils
 # ----------------------------
 def sanitize(text: str) -> str:
     if not text: return ""
-    # normalize weird spaces and tabs first
+    # normalize non-breaking spaces & tabs first
     text = text.replace("\u00A0", " ").replace("\t", " ")
     # normalize dashes/quotes
     text = text.replace("—","-").replace("–","-")
     text = re.sub(r"[\u201c\u201d]", '"', text)
     text = re.sub(r"[\u2018\u2019]", "'", text)
-    # collapse any whitespace runs
+    # collapse whitespace
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
@@ -99,10 +105,14 @@ def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional
         try:
             new_para.style = style
         except KeyError:
+            # Fallback to bullet glyph if style missing
             if run and style.lower().startswith("list") and not run.text.strip().startswith("•"):
                 run.text = f"• {run.text}"
     return new_para
 
+# ----------------------------
+# DOCX load helper
+# ----------------------------
 def ensure_docx(doc_or_bytes):
     try:
         if hasattr(doc_or_bytes, "paragraphs"):
@@ -116,9 +126,12 @@ def ensure_docx(doc_or_bytes):
         raise RuntimeError(f"Failed to open DOCX: {e}")
 
 # ----------------------------
-# bullets / quant helpers
+# Quantification helpers
 # ----------------------------
-QUANT_REGEX = re.compile(r"(\d|\$|%|\bhrs?\b|\bhour(s)?\b|\bday(s)?\b|\bweek(s)?\b|\bmonth(s)?\b|\byear(s)?\b|\b\d{1,3}k\b)", re.IGNORECASE)
+QUANT_REGEX = re.compile(
+    r"(\d|\$|%|\bhrs?\b|\bhour(s)?\b|\bday(s)?\b|\bweek(s)?\b|\bmonth(s)?\b|\byear(s)?\b|\b\d{1,3}k\b)",
+    re.IGNORECASE
+)
 
 def ensure_quantified(bullets: List[str], placeholder: str = "quantified impact: KPI TBD") -> List[str]:
     if not SHOW_KPI_PLACEHOLDER:
@@ -143,7 +156,7 @@ def is_bullet_para(p) -> bool:
     return False
 
 # ----------------------------
-# company / role detection
+# Company/role detection
 # ----------------------------
 STOPWORDS = {"inc","llc","llp","ltd","plc","corp","co","company","university","the"}
 
@@ -205,7 +218,6 @@ def map_experience_to_positions(experience: List[Dict], headers: List[Tuple[int,
         else:
             app.logger.warning("No header match for '%s' / role '%s'", comp, role)
     positions.sort(key=lambda x: x[1])
-    app.logger.info("Mapped positions: %s", positions)
     return positions
 
 def next_heading_between(doc: Document, a: int, b: int) -> Optional[int]:
@@ -215,7 +227,7 @@ def next_heading_between(doc: Document, a: int, b: int) -> Optional[int]:
     return None
 
 # ----------------------------
-# metrics (resume + JD)
+# Metrics (resume + JD)
 # ----------------------------
 NUM_PHRASE_REGEX = re.compile(
     r"(\$?\d+(?:\.\d+)?\s?(?:k|m|bn|b|million|billion)?|\d+\s?(?:%|percent)|\d+\+\b|"
@@ -294,7 +306,7 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
         return "Placeholder output due to model error."
 
 # ----------------------------
-# writers
+# Writers: summary & skills
 # ----------------------------
 def write_summary(doc: Document, summary: str):
     sec = find_section_bounds(doc, ["PROFESSIONAL SUMMARY","SUMMARY"])
@@ -322,6 +334,7 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
     for idx in range(s+1, e+1):
         line = sanitize(doc.paragraphs[idx].text)
         if not line: continue
+        # Inline "Category: items"
         if ":" in line and not line.endswith(":"):
             head, items_line = line.split(":", 1)
             key = norm_cat_name(head.strip())
@@ -336,6 +349,7 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
                 first_idx[key]["items"].update(items)
                 to_delete.append((idx, idx))
             continue
+        # Header line
         if line.endswith(":"):
             key = norm_cat_name(line[:-1].strip())
             if key not in first_idx:
@@ -351,14 +365,17 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
                 to_delete.append((dup_start, dup_end))
                 current_cat = None
             continue
+        # Items line
         if current_cat is not None:
             first_idx[current_cat]["items"].update([x.strip() for x in line.split(",") if x.strip()])
             if first_idx[current_cat]["items_idx"] is None:
                 first_idx[current_cat]["items_idx"] = idx
 
+    # Delete duplicates bottom-up
     for a,b in sorted(to_delete, key=lambda x: x[0], reverse=True):
         delete_range(doc, a, b); e -= (b-a+1)
 
+    # Write back merged items for existing categories
     for key,meta in first_idx.items():
         h = int(meta["header"]); it = meta["items_idx"]
         items_sorted = sorted(set(meta["items"]), key=lambda x: x.lower())
@@ -368,6 +385,7 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
             else:
                 insert_paragraph_after(doc.paragraphs[h], ", ".join(items_sorted))
 
+    # Append new incoming skills into existing or create new headers
     for cat, additions in new_skills.items():
         additions = [x for x in additions if x]
         if not additions: continue
@@ -391,7 +409,7 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
             insert_paragraph_after(header, ", ".join(additions))
 
 # ----------------------------
-# bullets generation & injection
+# Bullets: generate & inject
 # ----------------------------
 def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str], metrics_by_company: Dict[str, List[str]]) -> Dict[str, List[str]]:
     entries = []
@@ -454,26 +472,32 @@ def inject_bullets_strict(doc: Document,
                           bullets_by_company: Dict[str, List[str]],
                           exp_start: int,
                           exp_end: int):
+    """
+    Strict replace:
+      - process bottom-up,
+      - delete everything after each role line up to the next role line or next heading,
+      - insert new bullets immediately AFTER the matched role line.
+    """
     if not positions: return
 
-    # bottom-up to avoid index drift
     for idx in range(len(positions)-1, -1, -1):
         comp, line_i = positions[idx]
         next_line = positions[idx+1][1] if idx+1 < len(positions) else exp_end+1
         h = next_heading_between(doc, line_i+1, next_line-1)
         boundary_end = (h-1) if h is not None else (next_line-1)
-        app.logger.info("Replace block for '%s': line %d → %d", comp, line_i+1, boundary_end)
 
+        # delete full body (not the header itself)
         if boundary_end >= line_i + 1:
-            delete_range(doc, line_i+1, boundary_end)
+            delete_range(doc, line_i + 1, boundary_end)
 
+        # insert bullets
         anchor = doc.paragraphs[line_i]
         last = anchor
         for b in bullets_by_company.get(comp, []):
             last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
 
 # ----------------------------
-# routes
+# Routes
 # ----------------------------
 @app.route("/")
 def index():
@@ -488,6 +512,7 @@ def health():
 def tailor():
     origin = request.headers.get("Origin", "*")
 
+    # JSON or multipart
     if request.content_type and "multipart/form-data" in request.content_type.lower():
         base_resume_file = request.files.get("base_resume")
         payload_part = request.form.get("payload")
@@ -503,14 +528,14 @@ def tailor():
             return make_response(("invalid json", 400))
         base_resume_file = None
 
-    # toggles per request
+    # Refresh toggles per request
     global SHOW_KPI_PLACEHOLDER, BULLETS_STRICT_REPLACE
     SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
     BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", False)
     opts = (data.get("options") or {})
     if "show_kpi_placeholder" in opts: SHOW_KPI_PLACEHOLDER = bool(opts["show_kpi_placeholder"])
     if "strict_replace" in opts: BULLETS_STRICT_REPLACE = bool(opts["strict_replace"])
-    app.logger.info("Effective toggles → STRICT_REPLACE=%s, SHOW_KPI_PLACEHOLDER=%s",
+    app.logger.info("Toggles -> strict_replace=%s, show_kpi_placeholder=%s",
                     BULLETS_STRICT_REPLACE, SHOW_KPI_PLACEHOLDER)
 
     job_desc = sanitize((data or {}).get("job_description",""))
@@ -520,7 +545,7 @@ def tailor():
     skills_categories = cfg.get("skills_categories",[]) or []
     style_rules = (opts.get("style_rules") or [])
 
-    # base resume
+    # Load base resume
     if base_resume_file:
         base_doc = ensure_docx(base_resume_file)
     else:
@@ -530,29 +555,38 @@ def tailor():
         with open(base_path, "rb") as f:
             base_doc = ensure_docx(f)
 
-    # summary text
+    # Summary
     summary_prompt = (
         f"Write {summary_sentences} sentence professional summary aligned to the job description below. "
-        f"Use concise, specific language; prefer quantified outcomes when truthful; avoid buzzwords and dashes.\n---\n{job_desc[:1500]}"
+        f"Use concise, specific language; prefer quantified outcomes; avoid buzzwords and dashes.\n---\n{job_desc[:1500]}"
     )
     summary = sanitize(gpt(summary_prompt))
 
-    # experience section (accept several variants)
+    # Experience bounds (accept variants)
     exp_sec = (find_section_bounds(base_doc, ["PROFESSIONAL EXPERIENCE"])
                or find_section_bounds(base_doc, ["WORK EXPERIENCE"])
                or find_section_bounds(base_doc, ["EXPERIENCE"]))
     if not exp_sec:
-        # last resort: start from first role-like line in the whole doc
         exp_start, exp_end = 0, len(base_doc.paragraphs)-1
     else:
         exp_start, exp_end = exp_sec
 
-    # detect headers & map positions
+    # Detect role headers and map to your experience entries
     headers = scan_role_headers(base_doc, exp_start, exp_end)
-    app.logger.info("Detected role headers: %s", [(i, sanitize(t)[:80]) for i,t,_ in headers])
     positions = map_experience_to_positions(experience, headers)
 
-    # metrics
+    # Fallback mapping by order if fuzzy matching missed anything
+    if headers:
+        used_idxs = {i for _, i in positions}
+        free_headers = [h for h in headers if h[0] not in used_idxs]
+        need = [e for e in experience if sanitize(e.get("company","")) not in {c for c,_ in positions}]
+        fill = min(len(need), len(free_headers))
+        for k in range(fill):
+            comp_name = sanitize(need[k].get("company",""))
+            positions.append((comp_name, free_headers[k][0]))
+        positions.sort(key=lambda x: x[1])
+
+    # Build metrics per mapped role (resume block + JD)
     metrics_by_company: Dict[str, List[str]] = {}
     for i, (comp, line_i) in enumerate(positions):
         next_line = positions[i+1][1] if i+1 < len(positions) else exp_end+1
@@ -563,13 +597,15 @@ def tailor():
         seen=set()
         merged=[x for x in role_metrics + jd_metrics if (x not in seen and not seen.add(x))][:20]
         metrics_by_company[comp] = merged
+    # default metrics if some company had no mapped header
     for e in experience:
         comp = sanitize(e.get("company",""))
         metrics_by_company.setdefault(comp, extract_numeric_phrases(job_desc))
 
+    # Generate bullets (one call)
     bullets_by_company = gpt_bullets_batch(experience, job_desc, style_rules, metrics_by_company)
 
-    # skills (JD-driven)
+    # Skills map (JD-driven)
     SKILL_BANK = {
         "Business Analysis & Delivery": [
             "Requirements elicitation","User stories","Acceptance criteria","UAT","BPMN","UML",
@@ -607,16 +643,16 @@ def tailor():
         return out
     skills_map = pick_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories}) if skills_categories else {}
 
-    # edit doc
+    # Edit DOCX
     doc = base_doc
     write_summary(doc, summary)
     inject_skills(doc, skills_map)
 
     if positions:
+        # Always do strict replace when requested; otherwise remove contiguous bullets only
         if BULLETS_STRICT_REPLACE:
             inject_bullets_strict(doc, positions, bullets_by_company, exp_start, exp_end)
         else:
-            # non-strict: only contiguous bullet paragraphs under each role
             for comp, line_i in reversed(positions):
                 j = line_i + 1
                 while j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
@@ -628,8 +664,9 @@ def tailor():
                 for b in bullets_by_company.get(comp, []):
                     last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
     else:
-        app.logger.warning("No positions mapped; bullets not injected.")
+        app.logger.warning("No role headers detected; bullets not injected.")
 
+    # Return file
     out = io.BytesIO(); doc.save(out); out.seek(0)
     resp = make_response(send_file(
         out,
@@ -641,6 +678,9 @@ def tailor():
     resp.headers["Vary"] = "Origin"
     return resp
 
+# ---------------
+# Local dev
+# ---------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     app.run(host="0.0.0.0", port=port)
