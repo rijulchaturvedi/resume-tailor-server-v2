@@ -1,19 +1,29 @@
 from flask import Flask, request, send_file, jsonify, make_response
 from flask_cors import CORS
 from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.oxml import OxmlElement
 import io, os, json, re, logging
 from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
+# ----------------------------
+# App & CORS (mirrors original)
+# ----------------------------
 app = Flask(__name__)
-# Match original: allow chrome-extension origins to hit /tailor (OPTIONS + POST)
+# Allow chrome extension origins to hit /tailor (OPTIONS + POST)
 CORS(app, resources={r"/tailor": {"origins": "chrome-extension://*"}})
 app.logger.setLevel(logging.INFO)
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+# ----------------------------
+# Model / OpenAI settings
+# ----------------------------
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5")  # your chosen model name
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").lower() in ("1", "true", "yes")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").lower() not in ("0", "false", "no")
+OAI_BUDGET = float(os.getenv("OAI_BUDGET", "12"))  # seconds hard wall
 
 try:
     from openai import OpenAI
@@ -21,32 +31,64 @@ try:
 except Exception:
     _openai_available = False
 
+# ----------------------------
+# Text utils
+# ----------------------------
 def sanitize(text: str) -> str:
-    if not text: return ""
-    text = text.replace("—","-").replace("–","-")
+    if not text:
+        return ""
+    text = text.replace("—", "-").replace("–", "-")
     text = re.sub(r"[\u201c\u201d]", '"', text)
     text = re.sub(r"[\u2018\u2019]", "'", text)
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
+# ----------------------------
+# OpenAI helpers (fail-safe)
+# ----------------------------
 def _get_client():
     if not OPENAI_API_KEY or not _openai_available or not OAI_ENABLED:
         return None
     try:
-        # hard wall; retries off so we fail fast
+        # Fail fast; our outer thread guard enforces a hard wall too
         return OpenAI(api_key=OPENAI_API_KEY, timeout=12.0, max_retries=0)
     except Exception as e:
         app.logger.exception("OpenAI client init failed: %s", e)
         return None
 
-def _gpt_call(client, system, prompt):
+def _gpt_call_chat(client, system, prompt) -> str:
+    # Do not set temperature; some models accept only default
     resp = client.chat.completions.create(
         model=MODEL,
-        messages=[{"role": "system", "content": system},
-                  {"role": "user", "content": prompt}],
-        # do not set temperature; some models only allow default
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
     )
     return resp.choices[0].message.content.strip()
+
+def _gpt_call_resp(client, system, prompt) -> str:
+    # Optional: Responses API path
+    resp = client.responses.create(
+        model=MODEL,
+        input=[{"role": "system", "content": system},
+               {"role": "user", "content": prompt}],
+    )
+    # Best-effort output extraction across SDK variants
+    if hasattr(resp, "output_text"):
+        return str(resp.output_text).strip()
+    if hasattr(resp, "output") and resp.output:
+        # concatenate textual outputs
+        parts = []
+        for item in resp.output:
+            # newer SDK often presents text via item.content[0].text
+            content = getattr(item, "content", [])
+            if content and hasattr(content[0], "text"):
+                parts.append(content[0].text)
+        if parts:
+            return sanitize(" ".join(parts))
+    # Fallback to string
+    return sanitize(str(resp))
 
 def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> str:
     client = _get_client()
@@ -54,22 +96,24 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
         return "Placeholder output (model disabled or key missing)."
     try:
         # hard stop even if SDK/httpx misbehave
-        budget = float(os.getenv("OAI_BUDGET", "12"))
-        return EXECUTOR.submit(_gpt_call, client, system, prompt).result(timeout=budget)
+        if USE_RESPONSES_API:
+            return EXECUTOR.submit(_gpt_call_resp, client, system, prompt).result(timeout=OAI_BUDGET)
+        return EXECUTOR.submit(_gpt_call_chat, client, system, prompt).result(timeout=OAI_BUDGET)
     except FuturesTimeout:
-        app.logger.warning("OpenAI call timed out; returning placeholder.")
+        app.logger.warning("OpenAI call timed out; using placeholder.")
         return "Placeholder output due to timeout."
     except Exception as e:
-        app.logger.warning("OpenAI error; returning placeholder: %s", e)
+        app.logger.warning("OpenAI error; using placeholder: %s", e)
         return "Placeholder output due to model error."
 
+# ----------------------------
+# DOCX helpers
+# ----------------------------
 def ensure_docx(doc_or_bytes):
     """Accept a python-docx Document, a file-like object, or raw bytes and return a Document."""
     try:
-        # If it behaves like a python-docx Document (has paragraphs), use it
         if hasattr(doc_or_bytes, "paragraphs"):
-            return doc_or_bytes
-        # If it's a Werkzeug/FileStorage or any file-like, read bytes
+            return doc_or_bytes  # already a Document
         if hasattr(doc_or_bytes, "read"):
             data = doc_or_bytes.read()
         else:
@@ -79,68 +123,120 @@ def ensure_docx(doc_or_bytes):
     except Exception as e:
         raise RuntimeError(f"Failed to open DOCX: {e}")
 
+KNOWN_HEADINGS = {
+    "PROFESSIONAL SUMMARY","SUMMARY","EXPERIENCE","WORK EXPERIENCE",
+    "SKILLS","CORE SKILLS","TECHNICAL SKILLS","EDUCATION","PROJECTS",
+    "CERTIFICATIONS","PUBLICATIONS","ACHIEVEMENTS"
+}
+
+def is_heading(text: str) -> bool:
+    t = sanitize(text)
+    return (not t) or t.isupper() or (t.upper() in KNOWN_HEADINGS)
+
+def find_section_bounds(doc: Document, titles: List[str]) -> Optional[Tuple[int, int]]:
+    titles_up = {t.upper() for t in titles}
+    start = None
+    for i, p in enumerate(doc.paragraphs):
+        if sanitize(p.text).upper() in titles_up:
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(doc.paragraphs) - 1
+    for j in range(start + 1, len(doc.paragraphs)):
+        if is_heading(doc.paragraphs[j].text):
+            end = j - 1
+            break
+    return (start, end)
+
+def delete_range(doc: Document, start: int, end: int):
+    for i in range(end, start - 1, -1):
+        p = doc.paragraphs[i]._element
+        p.getparent().remove(p)
+
+def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional[str] = None) -> Paragraph:
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    new_para = Paragraph(new_p, paragraph._parent)
+    if text:
+        new_para.add_run(text)
+    if style:
+        new_para.style = style
+    return new_para
+
+# ----------------------------
+# Section writers
+# ----------------------------
 def write_summary(doc: Document, summary: str):
-    # simple heuristic: replace first non-empty paragraph under SUMMARY/PROFESSIONAL SUMMARY if found, else prepend
-    titles = ["PROFESSIONAL SUMMARY","SUMMARY"]
-    idxs = {i: sanitize(p.text) for i,p in enumerate(doc.paragraphs)}
-    start = next((i for i,t in idxs.items() if t.upper() in titles), None)
-    if start is not None:
-        # wipe all until next heading-like line
-        j = start + 1
-        while j < len(doc.paragraphs) and not sanitize(doc.paragraphs[j].text).isupper():
-            # delete this paragraph
-            p = doc.paragraphs[j]._element
-            p.getparent().remove(p)
-        # insert one paragraph
-        doc.add_paragraph(summary)
+    sec = find_section_bounds(doc, ["PROFESSIONAL SUMMARY", "SUMMARY"])
+    if sec:
+        s, e = sec
+        if e >= s + 1:
+            delete_range(doc, s + 1, e)
+        insert_paragraph_after(doc.paragraphs[s], sanitize(summary))
     else:
-        # prepend as new section
-        p = doc.add_paragraph("PROFESSIONAL SUMMARY")
-        p.runs[0].bold = True
-        doc.add_paragraph(summary)
+        # Append a new section at the end
+        heading = doc.add_paragraph()
+        heading.add_run("PROFESSIONAL SUMMARY").bold = True
+        doc.add_paragraph(sanitize(summary))
 
 def inject_skills(doc: Document, skills_map: Dict[str, list]):
-    # very basic: append/update SKILLS section
-    titles = ["SKILLS","CORE SKILLS","TECHNICAL SKILLS"]
-    idxs = {i: sanitize(p.text) for i,p in enumerate(doc.paragraphs)}
-    start = next((i for i,t in idxs.items() if t.upper() in [x.upper() for x in titles]), None)
-    if start is not None:
-        # wipe content after heading until next heading-like
-        j = start + 1
-        while j < len(doc.paragraphs) and not sanitize(doc.paragraphs[j].text).isupper():
-            p = doc.paragraphs[j]._element
-            p.getparent().remove(p)
-        # write categories
-        for cat, arr in skills_map.items():
-            doc.add_paragraph(f"{cat}:")
-            if arr:
-                doc.add_paragraph(", ".join(arr))
+    sec = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS"])
+    if sec:
+        s, e = sec
+        if e >= s + 1:
+            delete_range(doc, s + 1, e)
+        anchor = doc.paragraphs[s]
     else:
-        p = doc.add_paragraph("SKILLS"); p.runs[0].bold = True
-        for cat, arr in skills_map.items():
-            doc.add_paragraph(f"{cat}:")
-            if arr:
-                doc.add_paragraph(", ".join(arr))
+        anchor = doc.add_paragraph()
+        anchor.add_run("SKILLS").bold = True
+
+    last = anchor
+    for cat, arr in skills_map.items():
+        last = insert_paragraph_after(last, f"{cat}:")
+        if arr:
+            last = insert_paragraph_after(last, ", ".join(arr))
 
 def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
-    # naive strategy: find company name lines, replace following bullet-like lines
-    for i, para in enumerate(doc.paragraphs):
-        t = sanitize(para.text)
-        for comp, bullets in bullets_by_company.items():
-            if comp and comp.lower() in t.lower():
-                # remove subsequent bullet-ish paragraphs until blank or heading
-                j = i + 1
-                while j < len(doc.paragraphs):
-                    txt = sanitize(doc.paragraphs[j].text)
-                    if not txt or txt.isupper():
-                        break
-                    # delete this paragraph
-                    p = doc.paragraphs[j]._element
-                    p.getparent().remove(p)
-                # insert new bullets
-                for b in bullets:
-                    doc.add_paragraph(b, style="List Bullet")
+    if not bullets_by_company:
+        return
+    exp_sec = find_section_bounds(doc, ["EXPERIENCE", "WORK EXPERIENCE"])
+    start_idx = exp_sec[0] if exp_sec else 0
+    end_idx = exp_sec[1] if exp_sec else len(doc.paragraphs) - 1
 
+    i = start_idx
+    while i <= end_idx and i < len(doc.paragraphs):
+        t = sanitize(doc.paragraphs[i].text)
+        match_comp = next((c for c in bullets_by_company.keys() if c and c.lower() in t.lower()), None)
+        if match_comp is None:
+            i += 1
+            continue
+
+        # Find old bullet block just after the company line
+        j = i + 1
+        while j <= end_idx and j < len(doc.paragraphs):
+            txt = sanitize(doc.paragraphs[j].text)
+            if is_heading(txt) or not txt:
+                break
+            j += 1
+
+        # Delete old bullets
+        if j - 1 >= i + 1:
+            delete_range(doc, i + 1, j - 1)
+            end_idx -= (j - 1) - (i + 1) + 1
+
+        # Insert new bullets right after the company line
+        anchor = doc.paragraphs[i]
+        last = anchor
+        for b in bullets_by_company.get(match_comp, []):
+            last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
+
+        # Advance past newly added bullets
+        i = i + 1 + len(bullets_by_company.get(match_comp, []))
+
+# ----------------------------
+# Routes
+# ----------------------------
 @app.route("/")
 def index():
     return jsonify({"ok": True, "service": "resume-tailor-server", "endpoints": ["/health", "/tailor"]})
@@ -154,87 +250,103 @@ def tailor():
     # CORS preflight handled by Flask-CORS
     origin = request.headers.get("Origin", "*")
 
-    # Accept either JSON body (original flow) or multipart (new flow)
-    job_desc = ""
-    experience = []
-    skills_categories = []
-    summary_sentences = 2
-    style_rules = []
-
-    base_resume_file = None
+    # Accept either JSON body (original flow) or multipart (v2 flow)
     if request.content_type and "multipart/form-data" in request.content_type.lower():
         base_resume_file = request.files.get("base_resume")
         payload_part = request.form.get("payload")
-        if payload_part:
-            data = json.loads(payload_part)
-        else:
+        if not payload_part:
             return make_response(("missing payload", 400))
+        try:
+            data = json.loads(payload_part)
+        except Exception:
+            return make_response(("invalid payload json", 400))
     else:
-        # JSON
         try:
             data = request.get_json(force=True, silent=False)
         except Exception:
             return make_response(("invalid json", 400))
+        base_resume_file = None
 
-    job_desc = sanitize((data or {}).get("job_description",""))
-    cfg = (data or {}).get("resume_config",{}) or {}
+    job_desc = sanitize((data or {}).get("job_description", ""))
+    cfg = (data or {}).get("resume_config", {}) or {}
     summary_sentences = int(cfg.get("summary_sentences", 2))
-    experience = cfg.get("experience",[]) or []
-    skills_categories = cfg.get("skills_categories",[]) or []
-    style_rules = (data.get("options",{}) or {}).get("style_rules",[]) or []
+    experience = cfg.get("experience", []) or []
+    skills_categories = cfg.get("skills_categories", []) or []
+    style_rules = (data.get("options", {}) or {}).get("style_rules", []) or []
 
-    # get base resume
+    # Load base resume
     if base_resume_file:
         base_doc = ensure_docx(base_resume_file)
     else:
-        # use server-bundled docx (new base resume placed on server)
         base_path = os.path.join(os.path.dirname(__file__), "base_resume.docx")
         if not os.path.exists(base_path):
             return make_response(("server missing base_resume.docx", 500))
         with open(base_path, "rb") as f:
             base_doc = ensure_docx(f)
 
-    # Generate text (placeholder if no key)
-    summary_prompt = f"Write {summary_sentences} sentence professional summary aligned to this JD. Plain tone, no em/en dashes.\n---\n{job_desc[:4000]}"
+    # --- Generate content (OpenAI or placeholders)
+    summary_prompt = (
+        f"Write {summary_sentences} sentence professional summary aligned to this job description. "
+        f"Plain, specific tone; no em/en dashes.\n---\n{job_desc[:4000]}"
+    )
     summary = sanitize(gpt(summary_prompt))
 
     bullets_by_company: Dict[str, list] = {}
     for e in experience:
-        comp = e.get("company","")
-        role = e.get("role","")
+        comp = e.get("company", "")
+        role = e.get("role", "")
         k = int(e.get("bullets", 0))
         if k <= 0:
             bullets_by_company[comp] = []
             continue
-        bp = f"Write exactly {k} resume bullets for role '{role}'. 20-28 words each. Metricized, impact-focused. No company names inside bullets.\nAligned to JD:\n---\n{job_desc[:4000]}"
+        bp = (
+            f"Write exactly {k} resume bullets for role '{role}'. "
+            f"Each 20–28 words, specific, metricized when truthful. "
+            f"Do not include company names inside bullets.\nAligned to JD:\n---\n{job_desc[:4000]}"
+        )
         raw = gpt(bp)
-        # simple split
+        # split lines, strip numbering like "1. "
         parts = [sanitize(x) for x in re.split(r"[\n\r]+", raw) if sanitize(x)]
-        # strip leading "1. " etc
         clean = []
         for t in parts:
             m = re.match(r"^\s*(\d+)[\.\)]\s+(.*)$", t)
-            clean.append((m.group(2) if m else t))
+            clean.append(m.group(2) if m else t)
         bullets_by_company[comp] = clean[:k]
 
-    # skills grouping (very simple placeholder)
+    # Skills grouping (simple; backend enforces categories)
     skills_map = {c: [] for c in skills_categories}
     if skills_categories:
-        skills_map[skills_categories[0]] = ["SQL","Python","Power BI","Stakeholder management"]
+        # provide a non-empty example in the first bucket
+        skills_map[skills_categories[0]] = ["SQL", "Python", "Power BI", "Stakeholder management"]
 
-    # Edit docx
+    # --- Edit DOCX
     doc = base_doc
     write_summary(doc, summary)
     inject_skills(doc, skills_map)
     inject_bullets(doc, bullets_by_company)
 
+    # --- Return DOCX
     out = io.BytesIO()
-    doc.save(out); out.seek(0)
+    doc.save(out)
+    out.seek(0)
     filename = "Rijul_Chaturvedi_Tailored.docx"
 
-    resp = make_response(send_file(out, as_attachment=True, download_name=filename))
-    # Add explicit CORS for extension origin (mirrors original)
+    resp = make_response(
+        send_file(
+            out,
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            as_attachment=True,
+            download_name=filename,
+        )
+    )
+    # Echo origin explicitly (Flask-CORS also handles this, but mirrors original behavior)
     resp.headers["Access-Control-Allow-Origin"] = origin
     resp.headers["Vary"] = "Origin"
-    resp.headers["Content-Type"] = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     return resp
+
+# ---------------
+# Local dev entry
+# ---------------
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
