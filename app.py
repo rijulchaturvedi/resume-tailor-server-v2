@@ -24,8 +24,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").lower() in ("1", "true", "yes")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").lower() not in ("0", "false", "no")
-OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))            # hard wall (seconds) for each model call
-OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20.0"))  # SDK client timeout (seconds)
+OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))                 # hard wall (seconds) per model call
+OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20")) # SDK client timeout
 
 try:
     from openai import OpenAI
@@ -45,84 +45,7 @@ def sanitize(text: str) -> str:
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
-# ----------------------------
-# OpenAI helpers (fail-safe)
-# ----------------------------
-def _get_client():
-    if not OPENAI_API_KEY or not _openai_available or not OAI_ENABLED:
-        return None
-    try:
-        # Fail fast; outer thread guard enforces a hard wall too
-        return OpenAI(api_key=OPENAI_API_KEY, timeout=OAI_CLIENT_TIMEOUT, max_retries=0)
-    except Exception as e:
-        app.logger.exception("OpenAI client init failed: %s", e)
-        return None
-
-def _gpt_call_chat(client, system, prompt) -> str:
-    # Do not set temperature; some models accept only default
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    return resp.choices[0].message.content.strip()
-
-def _gpt_call_resp(client, system, prompt) -> str:
-    # Optional: Responses API path (only if SDK supports it)
-    if not hasattr(client, "responses"):
-        raise AttributeError("Responses API not available in this SDK")
-    resp = client.responses.create(
-        model=MODEL,
-        input=[{"role": "system", "content": system},
-               {"role": "user", "content": prompt}],
-    )
-    if hasattr(resp, "output_text"):
-        return str(resp.output_text).strip()
-    if hasattr(resp, "output") and resp.output:
-        parts = []
-        for item in resp.output:
-            content = getattr(item, "content", [])
-            if content and hasattr(content[0], "text"):
-                parts.append(content[0].text)
-        if parts:
-            return sanitize(" ".join(parts))
-    return sanitize(str(resp))
-
-def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> str:
-    client = _get_client()
-    if client is None:
-        return "Placeholder output (model disabled or key missing)."
-    try:
-        if USE_RESPONSES_API and hasattr(client, "responses"):
-            return EXECUTOR.submit(_gpt_call_resp, client, system, prompt).result(timeout=OAI_BUDGET)
-        return EXECUTOR.submit(_gpt_call_chat, client, system, prompt).result(timeout=OAI_BUDGET)
-    except FuturesTimeout:
-        app.logger.warning("OpenAI call timed out; using placeholder.")
-        return "Placeholder output due to timeout."
-    except Exception as e:
-        app.logger.warning("OpenAI error; using placeholder: %s", e)
-        return "Placeholder output due to model error."
-
-# ----------------------------
-# DOCX helpers
-# ----------------------------
-def ensure_docx(doc_or_bytes):
-    """Accept a python-docx Document, a file-like object, or raw bytes and return a Document."""
-    try:
-        if hasattr(doc_or_bytes, "paragraphs"):
-            return doc_or_bytes  # already a Document
-        if hasattr(doc_or_bytes, "read"):
-            data = doc_or_bytes.read()
-        else:
-            data = doc_or_bytes
-        bio = io.BytesIO(data)
-        return Document(bio)
-    except Exception as e:
-        raise RuntimeError(f"Failed to open DOCX: {e}")
-
-# Normalize headings and detect sections
+# Normalize headings for detection
 def _norm_heading(text: str) -> str:
     t = sanitize(text).upper()
     t = t.replace("&", "AND")
@@ -185,7 +108,102 @@ def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional
     return new_para
 
 # ----------------------------
-# Section writers
+# Bullet helpers (quant + detection)
+# ----------------------------
+QUANT_REGEX = re.compile(
+    r"(\d|\$|%|\bhrs?\b|\bhour(s)?\b|\bday(s)?\b|\bweek(s)?\b|\bmonth(s)?\b|\byear(s)?\b|\b\d{1,3}k\b)",
+    flags=re.IGNORECASE
+)
+
+def ensure_quantified(bullets: List[str], placeholder: str = "quantified impact: KPI TBD") -> List[str]:
+    out = []
+    for b in bullets:
+        t = sanitize(b)
+        if QUANT_REGEX.search(t):
+            out.append(t)
+        else:
+            out.append(f"{t} ({placeholder})")
+    return out
+
+def is_bullet_para(p) -> bool:
+    """Detect bullet/list paragraphs by style or leading glyphs/markers."""
+    try:
+        name = (p.style.name or "").lower()
+    except Exception:
+        name = ""
+    if "bullet" in name or "list" in name:
+        return True
+    t = sanitize(p.text)
+    if not t:
+        return False
+    if t.startswith(("•", "▪", "– ", "- ", "— ")):
+        return True
+    if re.match(r"^\s*\d+[\.\)]\s+", t):
+        return True
+    return False
+
+# ----------------------------
+# OpenAI helpers (fail-safe)
+# ----------------------------
+def _get_client():
+    if not OPENAI_API_KEY or not _openai_available or not OAI_ENABLED:
+        return None
+    try:
+        # Fail fast; outer thread guard enforces a hard wall too
+        return OpenAI(api_key=OPENAI_API_KEY, timeout=OAI_CLIENT_TIMEOUT, max_retries=0)
+    except Exception as e:
+        app.logger.exception("OpenAI client init failed: %s", e)
+        return None
+
+def _gpt_call_chat(client, system, prompt) -> str:
+    # Do not set temperature; some models accept only default
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return resp.choices[0].message.content.strip()
+
+def _gpt_call_resp(client, system, prompt) -> str:
+    # Optional: Responses API path (only if SDK supports it)
+    if not hasattr(client, "responses"):
+        raise AttributeError("Responses API not available in this SDK")
+    resp = client.responses.create(
+        model=MODEL,
+        input=[{"role": "system", "content": system},
+               {"role": "user", "content": prompt}],
+    )
+    if hasattr(resp, "output_text"):
+        return str(resp.output_text).strip()
+    if hasattr(resp, "output") and resp.output:
+        parts = []
+        for item in resp.output:
+            content = getattr(item, "content", [])
+            if content and hasattr(content[0], "text"):
+                parts.append(content[0].text)
+        if parts:
+            return sanitize(" ".join(parts))
+    return sanitize(str(resp))
+
+def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> str:
+    client = _get_client()
+    if client is None:
+        return "Placeholder output (model disabled or key missing)."
+    try:
+        if USE_RESPONSES_API and hasattr(client, "responses"):
+            return EXECUTOR.submit(_gpt_call_resp, client, system, prompt).result(timeout=OAI_BUDGET)
+        return EXECUTOR.submit(_gpt_call_chat, client, system, prompt).result(timeout=OAI_BUDGET)
+    except FuturesTimeout:
+        app.logger.warning("OpenAI call timed out; using placeholder.")
+        return "Placeholder output due to timeout."
+    except Exception as e:
+        app.logger.warning("OpenAI error; using placeholder: %s", e)
+        return "Placeholder output due to model error."
+
+# ----------------------------
+# DOCX writers
 # ----------------------------
 def write_summary(doc: Document, summary: str):
     sec = find_section_bounds(doc, ["PROFESSIONAL SUMMARY", "SUMMARY"])
@@ -200,24 +218,79 @@ def write_summary(doc: Document, summary: str):
         heading.add_run("PROFESSIONAL SUMMARY").bold = True
         doc.add_paragraph(sanitize(summary))
 
-def inject_skills(doc: Document, skills_map: Dict[str, list]):
+def inject_skills(doc: Document, new_skills: Dict[str, list]):
+    """
+    Keep existing skills content, append new items per category (dedup).
+    If section doesn't exist, create SKILLS & TOOLS. Categories are lines ending with ":".
+    """
+    if not new_skills:
+        return
+
     sec = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"])
-    if sec:
-        s, e = sec
-        if e >= s + 1:
-            delete_range(doc, s + 1, e)
-        anchor = doc.paragraphs[s]
-    else:
+    if sec is None:
         anchor = doc.add_paragraph()
         anchor.add_run("SKILLS & TOOLS").bold = True
+        sec = find_section_bounds(doc, ["SKILLS & TOOLS", "SKILLS AND TOOLS"])
+    s, e = sec
 
-    last = anchor
-    for cat, arr in skills_map.items():
-        last = insert_paragraph_after(last, f"{cat}:")
-        if arr:
-            last = insert_paragraph_after(last, ", ".join(arr))
+    # Parse existing categories and their item lines between s+1..e
+    existing_map: Dict[str, Tuple[int, set]] = {}  # cat -> (paragraph_index_for_items, set(items))
+    current_cat = None
+    for idx in range(s + 1, e + 1):
+        line = sanitize(doc.paragraphs[idx].text)
+        if not line:
+            continue
+        if line.endswith(":"):  # category header
+            current_cat = line[:-1].strip()
+            existing_map.setdefault(current_cat, (None, set()))
+        else:
+            if current_cat is not None:
+                items = [x.strip() for x in line.split(",") if x.strip()]
+                pi, aset = existing_map[current_cat]
+                aset.update(items)
+                existing_map[current_cat] = (idx, aset)
+
+    # Append or create categories (dedupe)
+    for cat, additions in new_skills.items():
+        additions = [x for x in additions if x]
+        if not additions:
+            continue
+
+        if cat in existing_map:
+            items_idx, aset = existing_map[cat]
+            to_add = [x for x in additions if x not in aset]
+            if not to_add:
+                continue
+            if items_idx is not None:
+                para = doc.paragraphs[items_idx]
+                current = sanitize(para.text)
+                joiner = (", " if current and not current.endswith(",") else "")
+                para.text = f"{current}{joiner}{', '.join(to_add)}"
+                aset.update(to_add)
+                existing_map[cat] = (items_idx, aset)
+            else:
+                # Find category header line
+                cat_idx = None
+                for idx in range(s + 1, e + 1):
+                    if sanitize(doc.paragraphs[idx].text).strip().lower() == f"{cat.lower()}:":
+                        cat_idx = idx
+                        break
+                anchor = doc.paragraphs[cat_idx] if cat_idx is not None else doc.paragraphs[e]
+                newp = insert_paragraph_after(anchor, ", ".join(to_add))
+                existing_map[cat] = (doc.paragraphs.index(newp), set(to_add))
+        else:
+            # New category → append header + items at the end of the section
+            sec = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"])
+            s, e = sec
+            anchor = doc.paragraphs[e]
+            header = insert_paragraph_after(anchor, f"{cat}:")
+            items_p = insert_paragraph_after(header, ", ".join(additions))
+            existing_map[cat] = (doc.paragraphs.index(items_p), set(additions))
 
 def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
+    """
+    Replace only the existing bullet paragraphs under each company with the new ones.
+    """
     if not bullets_by_company:
         return
     exp_sec = find_section_bounds(doc, ["EXPERIENCE", "WORK EXPERIENCE"])
@@ -232,26 +305,24 @@ def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
             i += 1
             continue
 
-        # Find old bullet block just after the company line
+        # Identify contiguous bullet paragraphs directly under this line
         j = i + 1
-        while j <= end_idx and j < len(doc.paragraphs):
-            txt = sanitize(doc.paragraphs[j].text)
-            if is_heading(txt) or not txt:
-                break
+        while j <= end_idx and j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
             j += 1
 
-        # Delete old bullets
+        # Delete ONLY the bullet block (if any)
         if j - 1 >= i + 1:
             delete_range(doc, i + 1, j - 1)
-            end_idx -= (j - 1) - (i + 1) + 1
+            removed = (j - 1) - (i + 1) + 1
+            end_idx -= removed
 
         # Insert new bullets right after the company line
         anchor = doc.paragraphs[i]
         last = anchor
         for b in bullets_by_company.get(match_comp, []):
-            last = insert_paragraph_after(last, sanitize(b), style="List Bullet")  # falls back safely
+            last = insert_paragraph_after(last, sanitize(b), style="List Bullet")  # safe fallback inside
 
-        # Advance past newly added bullets
+        # Move past the newly inserted bullets
         i = i + 1 + len(bullets_by_company.get(match_comp, []))
 
 # ----------------------------
@@ -297,13 +368,12 @@ def pick_skills(jd: str, bank: Dict[str, List[str]], top_k: int = 8) -> Dict[str
     return out
 
 # ----------------------------
-# Batch bullets (1 model call)
+# Batch bullets (1 model call, quantified)
 # ----------------------------
 def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str]) -> Dict[str, List[str]]:
     """
-    Single OpenAI call that returns bullets for ALL companies as pure JSON:
-    { "<company>": ["bullet1","bullet2", ...], ... }
-    Falls back to placeholders on error/timeout.
+    Single model call; returns {company: [bullets]}.
+    Enforces quantification where truthful; never fabricates numbers—adds a KPI marker if absent.
     """
     entries = []
     for e in experience:
@@ -318,7 +388,12 @@ def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str]) -
 
     rules_txt = (
         "\n".join(f"- {r}" for r in style_rules) if style_rules else
-        "- 20–28 words each\n- Start with strong verb; past tense\n- Include 1 truthful metric (%, $, time)\n- No company names inside bullets\n- Avoid buzzwords; focus on actions and outcomes"
+        "- 20–28 words each\n"
+        "- Start with a strong verb; past tense\n"
+        "- Include at least one quantifier when truthful (%, $, #, time, count); prefer real figures from the JD\n"
+        "- If no truthful figure exists, mark the slot with a neutral phrase like 'KPI TBD' instead of inventing numbers\n"
+        "- No company names inside bullets\n"
+        "- Avoid buzzwords; focus on actions and outcomes"
     )
 
     prompt = f"""Return ONLY JSON (no code fences) mapping company name to an array of bullet strings.
@@ -349,20 +424,15 @@ JSON schema example:
             comp = sanitize(e.get("company",""))
             k = int(e.get("bullets", 0) or 0)
             role = sanitize(e.get("role",""))
-            if k > 0:
-                data[comp] = [
-                    f"Delivered outcomes aligned with role '{role}', applying relevant skills; results tailored to the job description. (placeholder)"
-                    for _ in range(k)
-                ]
-            else:
-                data[comp] = []
+            data[comp] = [f"Delivered outcomes in '{role}' aligned to the JD (KPI TBD)" for _ in range(max(k,0))]
 
-    # Normalize counts + sanitize
+    # Normalize counts + sanitize + ensure quant signal present
     out = {}
     for e in experience:
         comp = sanitize(e.get("company",""))
         k = int(e.get("bullets", 0) or 0)
         bullets = [sanitize(b) for b in (data.get(comp) or [])][:k]
+        bullets = ensure_quantified(bullets)  # add KPI marker if no quantifier present
         out[comp] = bullets
     return out
 
@@ -420,22 +490,22 @@ def tailor():
     # --- Generate content (OpenAI or placeholders)
     summary_prompt = (
         f"Write {summary_sentences} sentence professional summary aligned to the job description below. "
-        f"Use concise, specific language; avoid buzzwords and dashes; highlight quantified impact if truthful.\n---\n{job_desc[:1500]}"
+        f"Use concise, specific language; prefer quantified outcomes when truthful; avoid buzzwords and dashes.\n---\n{job_desc[:1500]}"
     )
     summary = sanitize(gpt(summary_prompt))
 
-    # Batch bullets in one model call to avoid timeouts
+    # Batch bullets in one model call (quantified)
     bullets_by_company: Dict[str, List[str]] = gpt_bullets_batch(experience, job_desc, style_rules)
 
-    # Skills grouping (JD-driven, per category)
+    # Skills grouping (JD-driven, per category) — keep existing + append deduped
     desired_bank = {c: SKILL_BANK.get(c, []) for c in skills_categories}
     skills_map = pick_skills(job_desc, desired_bank) if skills_categories else {}
 
     # --- Edit DOCX
     doc = base_doc
     write_summary(doc, summary)
-    inject_skills(doc, skills_map)
-    inject_bullets(doc, bullets_by_company)
+    inject_skills(doc, skills_map)          # keep originals; append new (dedupe)
+    inject_bullets(doc, bullets_by_company) # replace existing bullet block; no stacking
 
     # --- Return DOCX
     out = io.BytesIO()
