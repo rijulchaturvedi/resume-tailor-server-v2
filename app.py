@@ -150,13 +150,30 @@ def delete_range(doc: Document, start: int, end: int):
         p.getparent().remove(p)
 
 def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional[str] = None) -> Paragraph:
+    """
+    Inserts a paragraph immediately after `paragraph`.
+    If `style` is provided but missing in the document, fall back to plain
+    paragraph and prefix a bullet if we intended a bullet style.
+    """
     new_p = OxmlElement("w:p")
     paragraph._p.addnext(new_p)
     new_para = Paragraph(new_p, paragraph._parent)
+
+    run = None
     if text:
-        new_para.add_run(text)
+        run = new_para.add_run(text)
+
     if style:
-        new_para.style = style
+        try:
+            new_para.style = style
+        except KeyError:
+            # Style doesn't exist in this template; if it was a bullet style,
+            # add a visible bullet prefix as a graceful fallback.
+            if run and style.lower().startswith("list"):
+                if not run.text.strip().startswith("•"):
+                    run.text = f"• {run.text}"
+            # else: silently keep default style
+
     return new_para
 
 # ----------------------------
@@ -224,7 +241,7 @@ def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
         anchor = doc.paragraphs[i]
         last = anchor
         for b in bullets_by_company.get(match_comp, []):
-            last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
+            last = insert_paragraph_after(last, sanitize(b), style="List Bullet")  # safe fallback inside
 
         # Advance past newly added bullets
         i = i + 1 + len(bullets_by_company.get(match_comp, []))
