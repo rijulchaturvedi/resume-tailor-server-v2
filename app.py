@@ -287,58 +287,104 @@ def write_summary(doc: Document, summary: str):
         doc.add_paragraph(sanitize(summary))
 
 def inject_skills(doc: Document, new_skills: Dict[str, list]):
-    if not new_skills: return
-    sec = find_section_bounds(doc, ["SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS"])
+    """
+    Keep existing skills; merge duplicate category headers; append new items (dedup).
+    Handles both:
+      A) Two-line blocks:
+         Category:
+         item1, item2
+      B) Inline blocks:
+         Category: item1, item2
+    """
+    if not new_skills:
+        return
+
+    sec = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"])
     if sec is None:
-        h = doc.add_paragraph(); h.add_run("SKILLS & TOOLS").bold = True
-        sec = find_section_bounds(doc, ["SKILLS & TOOLS","SKILLS AND TOOLS"])
-    s,e = sec
+        anchor = doc.add_paragraph()
+        anchor.add_run("SKILLS & TOOLS").bold = True
+        sec = find_section_bounds(doc, ["SKILLS & TOOLS", "SKILLS AND TOOLS"])
+    s, e = sec
 
-    def norm_cat_name(name: str) -> str: return _norm_heading(name).replace("  "," ").strip()
-    first_idx: Dict[str, Dict[str, object]] = {}
-    to_delete: List[Tuple[int,int]] = []
+    def norm_cat_name(name: str) -> str:
+        return _norm_heading(name).replace("  ", " ").strip()
+
+    first_idx: Dict[str, Dict[str, object]] = {}  # norm_cat -> {header:int, items_idx:Optional[int], items:set}
+    to_delete: List[Tuple[int, int]] = []
+
     current_cat = None
-
-    for idx in range(s+1, e+1):
+    for idx in range(s + 1, e + 1):
         line = sanitize(doc.paragraphs[idx].text)
-        if not line: continue
+        if not line:
+            continue
+
+        # Case B: Inline "Category: items" on one line
+        if ":" in line and not line.endswith(":"):
+            head, items_line = line.split(":", 1)
+            key = norm_cat_name(head.strip())
+            items = [x.strip() for x in items_line.split(",") if x.strip()]
+
+            if key not in first_idx:
+                # materialize as header + items on two lines
+                header = doc.paragraphs[idx]
+                header.text = f"{head.strip()}:"
+                insert_paragraph_after(header, ", ".join(items))
+                first_idx[key] = {"header": idx, "items_idx": idx + 1, "items": set(items)}
+                # our section end moves by +1 due to insertion
+                e += 1
+                # skip next line to avoid double processing
+            else:
+                # merge and delete this inline duplicate
+                first_idx[key]["items"].update(items)
+                to_delete.append((idx, idx))
+            continue
+
+        # Case A: Header-only line ending with ':'
         if line.endswith(":"):
             key = norm_cat_name(line[:-1].strip())
             if key not in first_idx:
                 first_idx[key] = {"header": idx, "items_idx": None, "items": set()}
                 current_cat = key
             else:
-                dup_start, dup_end = idx, idx
-                if idx+1 <= e:
-                    nxt = sanitize(doc.paragraphs[idx+1].text)
+                # duplicate header; if next line is items, merge them then delete both
+                dup_start = idx
+                dup_end = idx
+                if idx + 1 <= e:
+                    nxt = sanitize(doc.paragraphs[idx + 1].text)
                     if nxt and not nxt.endswith(":") and not is_heading(nxt):
-                        dup_end = idx+1
-                        items = [x.strip() for x in nxt.split(",") if x.strip()]
-                        first_idx[key]["items"].update(items)
+                        dup_end = idx + 1
+                        first_idx[key]["items"].update([x.strip() for x in nxt.split(",") if x.strip()])
                 to_delete.append((dup_start, dup_end))
                 current_cat = None
-        else:
-            if current_cat is not None:
-                items = [x.strip() for x in line.split(",") if x.strip()]
-                first_idx[current_cat]["items"].update(items)
-                if first_idx[current_cat]["items_idx"] is None:
-                    first_idx[current_cat]["items_idx"] = idx
+            continue
 
-    for a,b in sorted(to_delete, key=lambda x: x[0], reverse=True):
-        delete_range(doc, a, b); e -= (b-a+1)
+        # items line for the current category (Case A)
+        if current_cat is not None:
+            first_idx[current_cat]["items"].update([x.strip() for x in line.split(",") if x.strip()])
+            if first_idx[current_cat]["items_idx"] is None:
+                first_idx[current_cat]["items_idx"] = idx
 
-    for key,meta in first_idx.items():
-        h = int(meta["header"]); it = meta["items_idx"]
-        items_sorted = list(meta["items"])
+    # Delete duplicates bottom-up
+    for a, b in sorted(to_delete, key=lambda x: x[0], reverse=True):
+        delete_range(doc, a, b)
+        e -= (b - a + 1)
+
+    # Write back merged items for existing categories
+    for key, meta in first_idx.items():
+        h = int(meta["header"])
+        it = meta["items_idx"]
+        items_sorted = sorted(set(meta["items"]), key=lambda x: x.lower())
         if items_sorted:
             if it is not None and it < len(doc.paragraphs):
                 doc.paragraphs[it].text = ", ".join(items_sorted)
             else:
                 insert_paragraph_after(doc.paragraphs[h], ", ".join(items_sorted))
 
+    # Append new incoming skills into existing or create new headers
     for cat, additions in new_skills.items():
         additions = [x for x in additions if x]
-        if not additions: continue
+        if not additions:
+            continue
         key = norm_cat_name(cat)
         if key in first_idx:
             h = int(first_idx[key]["header"])
@@ -353,11 +399,11 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
             else:
                 insert_paragraph_after(doc.paragraphs[h], ", ".join(additions))
         else:
-            s2,e2 = (find_section_bounds(doc, ["SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS"]) or (0, len(doc.paragraphs)-1))
+            # New category at end of section
+            s2, e2 = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"]) or (0, len(doc.paragraphs) - 1)
             anchor = doc.paragraphs[e2]
             header = insert_paragraph_after(anchor, f"{cat}:")
             insert_paragraph_after(header, ", ".join(additions))
-
 # ----------------------------
 # Skills heuristic (JD-driven)
 # ----------------------------
@@ -465,30 +511,74 @@ def inject_bullets_by_positions(doc: Document,
                                 bullets_by_company: Dict[str, List[str]],
                                 exp_start: int,
                                 exp_end: int):
-    # positions sorted by idx
-    for idx, (comp, line_i) in enumerate(positions):
-        # boundary = next company or end of Experience
-        next_line = positions[idx+1][1] if idx+1 < len(positions) else exp_end+1
-        # if there is a heading between current and next_line, stop earlier
-        h = next_heading_between(doc, line_i+1, next_line-1)
-        boundary_end = (h-1) if h is not None else (next_line-1)
+    """
+    Robust strict replace:
+      • Deletes bottom-up to avoid index shift.
+      • Boundary is the next heading OR the next company line (any alias), whichever comes first.
+      • Also clears 'preamble' lines directly under the Experience heading.
+    """
+    # --- Build alias map for all companies
+    all_aliases: Dict[str, List[str]] = {comp: company_aliases(comp) for comp, _ in positions}
+    alias_flat = [(comp, a) for comp, al in all_aliases.items() for a in al if a]
 
-        # delete
-        if BULLETS_STRICT_REPLACE:
-            if boundary_end >= line_i+1:
-                delete_range(doc, line_i+1, boundary_end)
-                removed = boundary_end - (line_i+1) + 1
-                exp_end -= removed
-        else:
-            j = line_i + 1
-            while j <= exp_end and j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
-                j += 1
-            if j-1 >= line_i+1:
-                delete_range(doc, line_i+1, j-1)
-                removed = (j-1) - (line_i+1) + 1
-                exp_end -= removed
+    def is_company_line(text_lc: str, exclude_comp: Optional[str] = None) -> Optional[str]:
+        for comp, alias in alias_flat:
+            if exclude_comp and comp == exclude_comp:
+                continue
+            if alias and alias in text_lc:
+                return comp
+        return None
 
-        # insert
+    # --- Clear preamble right under the Experience header (noise bullets before first role)
+    if positions:
+        first_role_idx = positions[0][1]
+        j = exp_start + 1
+        while j < first_role_idx:
+            t = sanitize(doc.paragraphs[j].text)
+            if not t or is_heading(t):
+                break
+            j += 1
+        if j - 1 >= exp_start + 1:
+            delete_range(doc, exp_start + 1, j - 1)
+            removed = (j - 1) - (exp_start + 1) + 1
+            exp_end -= removed
+            # adjust stored positions after preamble removal
+            positions = [(c, i - removed) for (c, i) in positions]
+
+    # --- Process bottom-up so earlier indices remain valid
+    for idx in range(len(positions) - 1, -1, -1):
+        comp, line_i = positions[idx]
+
+        # Find dynamic boundary: next heading OR next company, whichever comes first
+        boundary_end = exp_end
+        j = line_i + 1
+        while j <= exp_end and j < len(doc.paragraphs):
+            txt = sanitize(doc.paragraphs[j].text)
+            if not txt:
+                # allow blank inside the block – still part of the role body
+                pass
+            else:
+                if is_heading(txt):
+                    boundary_end = j - 1
+                    break
+                hit = is_company_line(txt.lower(), exclude_comp=comp)
+                if hit:
+                    boundary_end = j - 1
+                    break
+            j += 1
+
+        # Delete everything in the role body
+        if boundary_end >= line_i + 1:
+            delete_range(doc, line_i + 1, boundary_end)
+            removed = boundary_end - (line_i + 1) + 1
+            exp_end -= removed
+            # shift stored positions that are above current index (earlier in doc) unchanged
+            # shift the ones after this block up by 'removed'
+            for k in range(idx + 1, len(positions)):
+                c2, i2 = positions[k]
+                positions[k] = (c2, i2 - removed)
+
+        # Insert new bullets right after the company line
         anchor = doc.paragraphs[line_i]
         last = anchor
         for b in bullets_by_company.get(comp, []):
