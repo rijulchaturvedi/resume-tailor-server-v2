@@ -27,8 +27,13 @@ def sanitize(text: str) -> str:
     return text.strip()
 
 def _get_client():
-    if not OPENAI_API_KEY or not _openai_available: return None
-    return OpenAI(api_key=OPENAI_API_KEY)
+    if not OPENAI_API_KEY or not _openai_available:
+        return None
+    try:
+        return OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        app.logger.exception("OpenAI client init failed: %s", e)
+        return None
 
 def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> str:
     client = _get_client()
@@ -118,6 +123,10 @@ def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
                 # insert new bullets
                 for b in bullets:
                     doc.add_paragraph(b, style="List Bullet")
+
+@app.route("/")
+def index():
+    return jsonify({"ok": True, "service": "resume-tailor-server", "endpoints": ["/health", "/tailor"]})
 
 @app.route("/health")
 def health():
