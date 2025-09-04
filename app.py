@@ -50,8 +50,8 @@ def _get_client():
     if not OPENAI_API_KEY or not _openai_available or not OAI_ENABLED:
         return None
     try:
-        # Fail fast; our outer thread guard enforces a hard wall too
-        return OpenAI(api_key=OPENAI_API_KEY, timeout=12.0, max_retries=0)
+        client_timeout = float(os.getenv("OAI_CLIENT_TIMEOUT", "12.0"))
+        return OpenAI(api_key=OPENAI_API_KEY, timeout=client_timeout, max_retries=0)
     except Exception as e:
         app.logger.exception("OpenAI client init failed: %s", e)
         return None
