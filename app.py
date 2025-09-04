@@ -30,8 +30,7 @@ def _env_bool(name: str, default: bool=False) -> bool:
     if v is None: return default
     return v.strip().lower() in ("1","true","yes","y","on")
 
-# Per-request toggles (also read from JSON)
-# DEFAULT STRICT REPLACE = ON so it actually replaces even if the extension forgets to send options.
+# Default strict replace = ON so old bullets are actually removed unless explicitly disabled.
 SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
 BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
 
@@ -46,13 +45,10 @@ except Exception:
 # ----------------------------
 def sanitize(text: str) -> str:
     if not text: return ""
-    # normalize NBSP & tabs
     text = text.replace("\u00A0", " ").replace("\t", " ")
-    # normalize dashes/quotes
     text = text.replace("—","-").replace("–","-")
     text = re.sub(r"[\u201c\u201d]", '"', text)
     text = re.sub(r"[\u2018\u2019]", "'", text)
-    # collapse whitespace
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
@@ -106,7 +102,6 @@ def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional
         try:
             new_para.style = style
         except KeyError:
-            # Fallback bullet glyph if style missing
             if run and style.lower().startswith("list") and not run.text.strip().startswith("•"):
                 run.text = f"• {run.text}"
     return new_para
@@ -227,7 +222,6 @@ def next_heading_between(doc: Document, a: int, b: int) -> Optional[int]:
             return j
     return None
 
-# Fallback: if a role header wasn’t detected, anchor by role+company text (no dates required)
 def find_role_anchor_by_text(doc: Document, exp_start: int, exp_end: int, company: str, role: str) -> Optional[int]:
     aliases = company_aliases(company)
     role_toks = set(norm_tokens(role))
@@ -350,7 +344,6 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
     for idx in range(s+1, e+1):
         line = sanitize(doc.paragraphs[idx].text)
         if not line: continue
-        # Inline "Category: items"
         if ":" in line and not line.endswith(":"):
             head, items_line = line.split(":", 1)
             key = norm_cat_name(head.strip())
@@ -365,7 +358,6 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
                 first_idx[key]["items"].update(items)
                 to_delete.append((idx, idx))
             continue
-        # Header line
         if line.endswith(":"):
             key = norm_cat_name(line[:-1].strip())
             if key not in first_idx:
@@ -381,17 +373,14 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
                 to_delete.append((dup_start, dup_end))
                 current_cat = None
             continue
-        # Items line
         if current_cat is not None:
             first_idx[current_cat]["items"].update([x.strip() for x in line.split(",") if x.strip()])
             if first_idx[current_cat]["items_idx"] is None:
                 first_idx[current_cat]["items_idx"] = idx
 
-    # Delete duplicates bottom-up
     for a,b in sorted(to_delete, key=lambda x: x[0], reverse=True):
         delete_range(doc, a, b); e -= (b-a+1)
 
-    # Write back merged items for existing categories
     for key,meta in first_idx.items():
         h = int(meta["header"]); it = meta["items_idx"]
         items_sorted = sorted(set(meta["items"]), key=lambda x: x.lower())
@@ -401,7 +390,6 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
             else:
                 insert_paragraph_after(doc.paragraphs[h], ", ".join(items_sorted))
 
-    # Append new incoming skills into existing or create new headers
     for cat, additions in new_skills.items():
         additions = [x for x in additions if x]
         if not additions: continue
@@ -502,11 +490,9 @@ def inject_bullets_strict(doc: Document,
         h = next_heading_between(doc, line_i+1, next_line-1)
         boundary_end = (h-1) if h is not None else (next_line-1)
 
-        # delete full body (not the header itself)
         if boundary_end >= line_i + 1:
             delete_range(doc, line_i + 1, boundary_end)
 
-        # insert bullets right below header
         anchor = doc.paragraphs[line_i]
         last = anchor
         for b in bullets_by_company.get(comp, []):
@@ -517,7 +503,7 @@ def inject_bullets_strict(doc: Document,
 # ----------------------------
 @app.route("/")
 def index():
-    return jsonify({"ok": True, "service": "resume-tailor-server", "endpoints": ["/health", "/tailor"]])
+    return jsonify({"ok": True, "service": "resume-tailor-server", "endpoints": ["/health", "/tailor"]})
 
 @app.route("/health")
 def health():
@@ -676,11 +662,9 @@ def tailor():
     inject_skills(doc, skills_map)
 
     if positions:
-        # Strict replace is ON by default
         if BULLETS_STRICT_REPLACE:
             inject_bullets_strict(doc, positions, bullets_by_company, exp_start, exp_end)
         else:
-            # non-strict: clear contiguous bullets only
             for comp, line_i in reversed(positions):
                 j = line_i + 1
                 while j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
@@ -694,7 +678,6 @@ def tailor():
     else:
         app.logger.warning("No role headers detected or mapped; bullets not injected.")
 
-    # Return file
     out = io.BytesIO(); doc.save(out); out.seek(0)
     resp = make_response(send_file(
         out,
