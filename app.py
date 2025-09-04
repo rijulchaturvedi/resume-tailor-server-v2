@@ -8,7 +8,7 @@ from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 # ----------------------------
-# App & CORS (Chrome extension → /tailor)
+# App & CORS
 # ----------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/tailor": {"origins": "chrome-extension://*"}})
@@ -17,20 +17,20 @@ app.logger.setLevel(logging.INFO)
 # ----------------------------
 # Model / OpenAI settings
 # ----------------------------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # set to "gpt-5" if you want
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # set to "gpt-5" if desired
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").strip().lower() in ("1", "true", "yes")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").strip().lower() not in ("0", "false", "no")
-OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))                 # hard wall (s) per model call
-OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20")) # SDK client timeout (s)
+OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))
+OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20"))
 
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None: return default
     return v.strip().lower() in ("1","true","yes","y","on")
 
-# Defaults (also re-read per request)
+# toggles (also re-read per request)
 SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
 BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", False)
 
@@ -60,7 +60,7 @@ def _norm_heading(text: str) -> str:
 
 KNOWN_HEADINGS = {
     "PROFESSIONAL SUMMARY","SUMMARY","EXPERIENCE","WORK EXPERIENCE",
-    "SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS AND TOOLS","SKILLS & TOOLS","EDUCATION",
+    "SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS","EDUCATION",
     "PROJECTS","CERTIFICATIONS","PUBLICATIONS","ACHIEVEMENTS"
 }
 
@@ -100,13 +100,13 @@ def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional
         try:
             new_para.style = style
         except KeyError:
-            # Fallback to bullet glyph if style missing
+            # fallback if style absent: add bullet glyph
             if run and style.lower().startswith("list") and not run.text.strip().startswith("•"):
                 run.text = f"• {run.text}"
     return new_para
 
 # ----------------------------
-# DOCX load helper
+# DOCX helper
 # ----------------------------
 def ensure_docx(doc_or_bytes):
     try:
@@ -121,7 +121,7 @@ def ensure_docx(doc_or_bytes):
         raise RuntimeError(f"Failed to open DOCX: {e}")
 
 # ----------------------------
-# Bullet helpers (quantification & detection)
+# Quant helpers
 # ----------------------------
 QUANT_REGEX = re.compile(
     r"(\d|\$|%|\bhrs?\b|\bhour(s)?\b|\bday(s)?\b|\bweek(s)?\b|\bmonth(s)?\b|\byear(s)?\b|\b\d{1,3}k\b)",
@@ -151,40 +151,87 @@ def is_bullet_para(p) -> bool:
     return False
 
 # ----------------------------
-# Company/role matching (robust)
+# Company + role detection (robust)
 # ----------------------------
 STOPWORDS = {"inc","llc","llp","ltd","plc","corp","co","company","university","the"}
+
+def norm_tokens(s: str) -> List[str]:
+    s = sanitize(s).lower()
+    s = re.sub(r"\(.*?\)", "", s)
+    s = re.sub(r"[^a-z0-9\s&\-]", " ", s)
+    toks = [t for t in s.split() if t and t not in STOPWORDS]
+    return toks
 
 def company_aliases(company: str) -> List[str]:
     c = sanitize(company)
     parts = [p.strip() for p in c.split(",") if p.strip()]
     core = parts[0] if parts else c
-    # remove parentheticals and stopwords
-    def norm(x: str) -> str:
-        x = x.lower()
-        x = re.sub(r"\(.*?\)", "", x)
-        x = re.sub(r"[^a-z0-9\s&\-]", " ", x)
-        toks = [t for t in x.split() if t and t not in STOPWORDS]
-        return " ".join(toks).strip()
-    aliases = {norm(c), norm(core)}
-    # also add small alias: first 2 words of core
-    core_words = norm(core).split()
+    aliases = set()
+    aliases.add(" ".join(norm_tokens(c)))
+    aliases.add(" ".join(norm_tokens(core)))
+    core_words = norm_tokens(core)
     if core_words:
         aliases.add(" ".join(core_words[:2]))
     return [a for a in aliases if a]
 
-def find_company_line_index(doc: Document, company: str, role: str, start_idx: int, end_idx: int) -> Optional[int]:
-    aliases = company_aliases(company)
-    role_l = sanitize(role).lower()
-    for i in range(start_idx, end_idx+1):
-        t = sanitize(doc.paragraphs[i].text).lower()
+MONTHS = r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December"
+ROLE_LINE_RE = re.compile(rf"\b({MONTHS})\b\s+\d{{4}}\s*-\s*(Present|\b({MONTHS})\b\s+\d{{4}})", re.IGNORECASE)
+
+def scan_role_headers(doc: Document, exp_start: int, exp_end: int) -> List[Tuple[int, str, str]]:
+    """
+    Return list of (idx, role_line_text, company_guess) for lines that look like "Role, Company, ...  Month YYYY - Present".
+    company_guess = second comma-separated segment when available.
+    """
+    headers = []
+    for i in range(exp_start+1, exp_end+1):
+        t = sanitize(doc.paragraphs[i].text)
         if not t: continue
-        # hit if any alias matches OR (role and alias both appear)
-        if any(a and a in t for a in aliases):
-            return i
-        if role_l and (role_l in t) and any(a and a in t for a in aliases):
-            return i
-    return None
+        if ROLE_LINE_RE.search(t):
+            # Guess company as second comma-separated piece
+            segs = [s.strip() for s in t.split(",")]
+            company_guess = segs[1] if len(segs) >= 2 else ""
+            headers.append((i, t, company_guess))
+    return headers
+
+def map_experience_to_positions(experience: List[Dict], headers: List[Tuple[int,str,str]]) -> List[Tuple[str, int]]:
+    """
+    Map each experience entry to the best-matching header line index.
+    Returns list of tuples (company_from_payload, header_index). Ensures unique assignment.
+    """
+    used = set()
+    positions: List[Tuple[str,int]] = []
+    for e in experience:
+        comp = sanitize(e.get("company",""))
+        role = sanitize(e.get("role",""))
+        aliases = company_aliases(comp)
+        best = None
+        best_score = 0
+        for (idx, line, company_guess) in headers:
+            if idx in used: continue
+            lc = sanitize(line).lower()
+            # score by alias containment + role token overlap
+            score = 0
+            if any(a and a in lc for a in aliases):
+                score += 2
+            rtoks = set(norm_tokens(role))
+            ltoks = set(norm_tokens(line))
+            if rtoks and (len(rtoks & ltoks) > 0):
+                score += 1
+            # slight bonus if company_guess tokens intersect aliases
+            cg_toks = " ".join(norm_tokens(company_guess))
+            if cg_toks and any(a and a in cg_toks for a in aliases):
+                score += 1
+            if score > best_score:
+                best_score = score
+                best = idx
+        if best is not None:
+            used.add(best)
+            positions.append((comp, best))
+        else:
+            app.logger.warning("No header match for '%s' / role '%s'", comp, role)
+    # sort by index order in the doc
+    positions.sort(key=lambda x: x[1])
+    return positions
 
 def next_heading_between(doc: Document, a: int, b: int) -> Optional[int]:
     for j in range(max(a,0), min(b, len(doc.paragraphs)) + 1):
@@ -193,7 +240,7 @@ def next_heading_between(doc: Document, a: int, b: int) -> Optional[int]:
     return None
 
 # ----------------------------
-# Metric harvesting (from resume blocks + JD)
+# Metrics (resume + JD)
 # ----------------------------
 NUM_PHRASE_REGEX = re.compile(
     r"(\$?\d+(?:\.\d+)?\s?(?:k|m|bn|b|million|billion)?|\d+\s?(?:%|percent)|\d+\+\b|"
@@ -211,9 +258,9 @@ def extract_numeric_phrases(text: str, max_phrases: int = 12) -> List[str]:
             break
     return found
 
-def harvest_metrics_from_role_block(doc: Document, start_idx: int, boundary_end: int) -> List[str]:
+def harvest_metrics_from_block(doc: Document, start_idx: int, boundary_end: int) -> List[str]:
     buf = []
-    for i in range(start_idx+1, min(boundary_end+1, len(doc.paragraphs))):
+    for i in range(start_idx + 1, min(boundary_end + 1, len(doc.paragraphs))):
         t = sanitize(doc.paragraphs[i].text)
         if not t or is_heading(t):
             break
@@ -221,7 +268,7 @@ def harvest_metrics_from_role_block(doc: Document, start_idx: int, boundary_end:
     return extract_numeric_phrases("  ".join(buf))
 
 # ----------------------------
-# OpenAI helpers (fail-safe)
+# OpenAI helpers
 # ----------------------------
 def _get_client():
     if not OPENAI_API_KEY or not _openai_available or not OAI_ENABLED:
@@ -274,7 +321,7 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
         return "Placeholder output due to model error."
 
 # ----------------------------
-# DOCX writers
+# Writers: Summary / Skills
 # ----------------------------
 def write_summary(doc: Document, summary: str):
     sec = find_section_bounds(doc, ["PROFESSIONAL SUMMARY","SUMMARY"])
@@ -288,91 +335,62 @@ def write_summary(doc: Document, summary: str):
 
 def inject_skills(doc: Document, new_skills: Dict[str, list]):
     """
-    Keep existing skills; merge duplicate category headers; append new items (dedup).
-    Handles both:
-      A) Two-line blocks:
-         Category:
-         item1, item2
-      B) Inline blocks:
-         Category: item1, item2
+    Merge duplicate categories; support both 'Header:' + items on next line AND 'Header: items' inline.
     """
-    if not new_skills:
-        return
-
-    sec = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"])
+    if not new_skills: return
+    sec = find_section_bounds(doc, ["SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS"])
     if sec is None:
-        anchor = doc.add_paragraph()
-        anchor.add_run("SKILLS & TOOLS").bold = True
-        sec = find_section_bounds(doc, ["SKILLS & TOOLS", "SKILLS AND TOOLS"])
-    s, e = sec
+        h = doc.add_paragraph(); h.add_run("SKILLS & TOOLS").bold = True
+        sec = find_section_bounds(doc, ["SKILLS & TOOLS","SKILLS AND TOOLS"])
+    s,e = sec
 
-    def norm_cat_name(name: str) -> str:
-        return _norm_heading(name).replace("  ", " ").strip()
-
-    first_idx: Dict[str, Dict[str, object]] = {}  # norm_cat -> {header:int, items_idx:Optional[int], items:set}
-    to_delete: List[Tuple[int, int]] = []
-
+    def norm_cat_name(name: str) -> str: return _norm_heading(name).replace("  "," ").strip()
+    first_idx: Dict[str, Dict[str, object]] = {}
+    to_delete: List[Tuple[int,int]] = []
     current_cat = None
-    for idx in range(s + 1, e + 1):
-        line = sanitize(doc.paragraphs[idx].text)
-        if not line:
-            continue
 
-        # Case B: Inline "Category: items" on one line
+    for idx in range(s+1, e+1):
+        line = sanitize(doc.paragraphs[idx].text)
+        if not line: continue
         if ":" in line and not line.endswith(":"):
             head, items_line = line.split(":", 1)
             key = norm_cat_name(head.strip())
             items = [x.strip() for x in items_line.split(",") if x.strip()]
-
             if key not in first_idx:
-                # materialize as header + items on two lines
                 header = doc.paragraphs[idx]
                 header.text = f"{head.strip()}:"
                 insert_paragraph_after(header, ", ".join(items))
-                first_idx[key] = {"header": idx, "items_idx": idx + 1, "items": set(items)}
-                # our section end moves by +1 due to insertion
+                first_idx[key] = {"header": idx, "items_idx": idx+1, "items": set(items)}
                 e += 1
-                # skip next line to avoid double processing
             else:
-                # merge and delete this inline duplicate
                 first_idx[key]["items"].update(items)
                 to_delete.append((idx, idx))
             continue
-
-        # Case A: Header-only line ending with ':'
         if line.endswith(":"):
             key = norm_cat_name(line[:-1].strip())
             if key not in first_idx:
                 first_idx[key] = {"header": idx, "items_idx": None, "items": set()}
                 current_cat = key
             else:
-                # duplicate header; if next line is items, merge them then delete both
-                dup_start = idx
-                dup_end = idx
-                if idx + 1 <= e:
-                    nxt = sanitize(doc.paragraphs[idx + 1].text)
+                dup_start, dup_end = idx, idx
+                if idx+1 <= e:
+                    nxt = sanitize(doc.paragraphs[idx+1].text)
                     if nxt and not nxt.endswith(":") and not is_heading(nxt):
-                        dup_end = idx + 1
+                        dup_end = idx+1
                         first_idx[key]["items"].update([x.strip() for x in nxt.split(",") if x.strip()])
                 to_delete.append((dup_start, dup_end))
                 current_cat = None
             continue
-
-        # items line for the current category (Case A)
         if current_cat is not None:
             first_idx[current_cat]["items"].update([x.strip() for x in line.split(",") if x.strip()])
             if first_idx[current_cat]["items_idx"] is None:
                 first_idx[current_cat]["items_idx"] = idx
 
-    # Delete duplicates bottom-up
-    for a, b in sorted(to_delete, key=lambda x: x[0], reverse=True):
-        delete_range(doc, a, b)
-        e -= (b - a + 1)
+    for a,b in sorted(to_delete, key=lambda x: x[0], reverse=True):
+        delete_range(doc, a, b); e -= (b-a+1)
 
-    # Write back merged items for existing categories
-    for key, meta in first_idx.items():
-        h = int(meta["header"])
-        it = meta["items_idx"]
+    for key,meta in first_idx.items():
+        h = int(meta["header"]); it = meta["items_idx"]
         items_sorted = sorted(set(meta["items"]), key=lambda x: x.lower())
         if items_sorted:
             if it is not None and it < len(doc.paragraphs):
@@ -380,11 +398,9 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
             else:
                 insert_paragraph_after(doc.paragraphs[h], ", ".join(items_sorted))
 
-    # Append new incoming skills into existing or create new headers
     for cat, additions in new_skills.items():
         additions = [x for x in additions if x]
-        if not additions:
-            continue
+        if not additions: continue
         key = norm_cat_name(cat)
         if key in first_idx:
             h = int(first_idx[key]["header"])
@@ -399,53 +415,13 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
             else:
                 insert_paragraph_after(doc.paragraphs[h], ", ".join(additions))
         else:
-            # New category at end of section
-            s2, e2 = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"]) or (0, len(doc.paragraphs) - 1)
+            s2,e2 = (find_section_bounds(doc, ["SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS"]) or (0, len(doc.paragraphs)-1))
             anchor = doc.paragraphs[e2]
             header = insert_paragraph_after(anchor, f"{cat}:")
             insert_paragraph_after(header, ", ".join(additions))
-# ----------------------------
-# Skills heuristic (JD-driven)
-# ----------------------------
-SKILL_BANK = {
-    "Business Analysis & Delivery": [
-        "Requirements elicitation","User stories","Acceptance criteria","UAT","BPMN","UML",
-        "Process re-engineering","Traceability (RTM)","Fit–gap","Prioritization (RICE, MoSCoW)"
-    ],
-    "Project & Program Management": [
-        "Agile Scrum","Kanban","SDLC","RACI","RAID","Sprint planning","Roadmapping","Stakeholder management"
-    ],
-    "Data, Analytics & BI": [
-        "SQL","Python","Pandas","NumPy","Power BI","Tableau","A/B testing","Forecasting","Anomaly detection"
-    ],
-    "Cloud, Data & MLOps": [
-        "AWS Lambda","S3","Redshift","Airflow","dbt","Spark","Databricks","ETL/ELT orchestration"
-    ],
-    "AI, ML & GenAI": [
-        "LLMs","RAG","Prompt design","Hugging Face","FAISS","Model monitoring","Inference optimization"
-    ],
-    "Enterprise Platforms & Integration": [
-        "Salesforce","NetSuite","SAP","ServiceNow","REST APIs","Postman","Git","Azure DevOps","Jira"
-    ],
-    "Collaboration, Design & Stakeholder": [
-        "Miro","Figma","Lucidchart","Wireframing","Prototyping","Executive communication","Workshops"
-    ],
-}
-
-def pick_skills(jd: str, bank: Dict[str, List[str]], top_k: int = 8) -> Dict[str, List[str]]:
-    jd_l = jd.lower(); out = {}
-    for cat, items in bank.items():
-        hits = []
-        for s in items:
-            pat = re.escape(s.lower()).replace(r"\ ", r"\s+")
-            if re.search(rf"(?<![A-Za-z0-9]){pat}(?![A-Za-z0-9])", jd_l):
-                hits.append(s)
-        seen=set(); merged=[x for x in hits+items if (x not in seen and not seen.add(x))]
-        out[cat] = merged[:top_k]
-    return out
 
 # ----------------------------
-# Bullets (single model call, metrics-aware)
+# Bullets: generate & inject
 # ----------------------------
 def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str], metrics_by_company: Dict[str, List[str]]) -> Dict[str, List[str]]:
     entries = []
@@ -503,82 +479,33 @@ JSON schema example:
         out[comp] = ensure_quantified(bullets)
     return out
 
-# ----------------------------
-# Injection using found positions (robust strict replace)
-# ----------------------------
-def inject_bullets_by_positions(doc: Document,
-                                positions: List[Tuple[str, int]],
-                                bullets_by_company: Dict[str, List[str]],
-                                exp_start: int,
-                                exp_end: int):
+def inject_bullets_strict(doc: Document,
+                          positions: List[Tuple[str,int]],
+                          bullets_by_company: Dict[str, List[str]],
+                          exp_start: int,
+                          exp_end: int):
     """
-    Robust strict replace:
-      • Deletes bottom-up to avoid index shift.
-      • Boundary is the next heading OR the next company line (any alias), whichever comes first.
-      • Also clears 'preamble' lines directly under the Experience heading.
+    Strict replace:
+      - process bottom-up,
+      - delete everything after each role line up to the next role line or next heading,
+      - insert new bullets immediately AFTER the matched role line.
     """
-    # --- Build alias map for all companies
-    all_aliases: Dict[str, List[str]] = {comp: company_aliases(comp) for comp, _ in positions}
-    alias_flat = [(comp, a) for comp, al in all_aliases.items() for a in al if a]
+    if not positions:
+        return
 
-    def is_company_line(text_lc: str, exclude_comp: Optional[str] = None) -> Optional[str]:
-        for comp, alias in alias_flat:
-            if exclude_comp and comp == exclude_comp:
-                continue
-            if alias and alias in text_lc:
-                return comp
-        return None
-
-    # --- Clear preamble right under the Experience header (noise bullets before first role)
-    if positions:
-        first_role_idx = positions[0][1]
-        j = exp_start + 1
-        while j < first_role_idx:
-            t = sanitize(doc.paragraphs[j].text)
-            if not t or is_heading(t):
-                break
-            j += 1
-        if j - 1 >= exp_start + 1:
-            delete_range(doc, exp_start + 1, j - 1)
-            removed = (j - 1) - (exp_start + 1) + 1
-            exp_end -= removed
-            # adjust stored positions after preamble removal
-            positions = [(c, i - removed) for (c, i) in positions]
-
-    # --- Process bottom-up so earlier indices remain valid
+    # bottom-up to avoid index drift
     for idx in range(len(positions) - 1, -1, -1):
         comp, line_i = positions[idx]
+        next_line = positions[idx+1][1] if idx+1 < len(positions) else exp_end+1
+        # stop earlier if a heading appears before next role
+        h = next_heading_between(doc, line_i+1, next_line-1)
+        boundary_end = (h-1) if h is not None else (next_line-1)
 
-        # Find dynamic boundary: next heading OR next company, whichever comes first
-        boundary_end = exp_end
-        j = line_i + 1
-        while j <= exp_end and j < len(doc.paragraphs):
-            txt = sanitize(doc.paragraphs[j].text)
-            if not txt:
-                # allow blank inside the block – still part of the role body
-                pass
-            else:
-                if is_heading(txt):
-                    boundary_end = j - 1
-                    break
-                hit = is_company_line(txt.lower(), exclude_comp=comp)
-                if hit:
-                    boundary_end = j - 1
-                    break
-            j += 1
-
-        # Delete everything in the role body
+        # delete everything under role line
         if boundary_end >= line_i + 1:
             delete_range(doc, line_i + 1, boundary_end)
-            removed = boundary_end - (line_i + 1) + 1
-            exp_end -= removed
-            # shift stored positions that are above current index (earlier in doc) unchanged
-            # shift the ones after this block up by 'removed'
-            for k in range(idx + 1, len(positions)):
-                c2, i2 = positions[k]
-                positions[k] = (c2, i2 - removed)
 
-        # Insert new bullets right after the company line
+        # insert bullets right after role line
         anchor = doc.paragraphs[line_i]
         last = anchor
         for b in bullets_by_company.get(comp, []):
@@ -616,7 +543,7 @@ def tailor():
             return make_response(("invalid json", 400))
         base_resume_file = None
 
-    # Refresh toggles per request (env + JSON overrides)
+    # refresh toggles (env + per-request overrides)
     global SHOW_KPI_PLACEHOLDER, BULLETS_STRICT_REPLACE
     SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
     BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", False)
@@ -633,7 +560,7 @@ def tailor():
     skills_categories = cfg.get("skills_categories",[]) or []
     style_rules = (opts.get("style_rules") or [])
 
-    # Load base resume
+    # base resume
     if base_resume_file:
         base_doc = ensure_docx(base_resume_file)
     else:
@@ -643,67 +570,101 @@ def tailor():
         with open(base_path, "rb") as f:
             base_doc = ensure_docx(f)
 
-    # --- Summary
+    # summary
     summary_prompt = (
         f"Write {summary_sentences} sentence professional summary aligned to the job description below. "
         f"Use concise, specific language; prefer quantified outcomes when truthful; avoid buzzwords and dashes.\n---\n{job_desc[:1500]}"
     )
     summary = sanitize(gpt(summary_prompt))
 
-    # --- Experience section bounds
+    # experience bounds
     exp_sec = find_section_bounds(base_doc, ["EXPERIENCE","WORK EXPERIENCE"])
     exp_start = exp_sec[0] if exp_sec else 0
     exp_end = exp_sec[1] if exp_sec else len(base_doc.paragraphs)-1
 
-    # --- Find all role line positions robustly
-    found_positions: List[Tuple[str,int]] = []  # [(company, idx)]
-    comp_to_idx: Dict[str,int] = {}
-    for e in experience:
-        comp = sanitize(e.get("company","")); role = sanitize(e.get("role",""))
-        idx = find_company_line_index(base_doc, comp, role, exp_start, exp_end)
-        if idx is not None:
-            found_positions.append((comp, idx))
-            comp_to_idx[comp] = idx
-        else:
-            app.logger.warning("No match for company '%s' role '%s' in document.", comp, role)
-    found_positions.sort(key=lambda x: x[1])
+    # detect role headers and map experience to actual lines
+    headers = scan_role_headers(base_doc, exp_start, exp_end)
+    positions = map_experience_to_positions(experience, headers)
 
-    # --- Build metrics_by_company using found boundaries
+    # metrics (from actual role blocks + JD)
     metrics_by_company: Dict[str, List[str]] = {}
-    for i, (comp, idx) in enumerate(found_positions):
-        next_idx = found_positions[i+1][1] if i+1 < len(found_positions) else exp_end+1
-        h = next_heading_between(base_doc, idx+1, next_idx-1)
-        boundary_end = (h-1) if h is not None else (next_idx-1)
-        role_metrics = harvest_metrics_from_role_block(base_doc, idx, boundary_end)
+    for i, (comp, line_i) in enumerate(positions):
+        next_line = positions[i+1][1] if i+1 < len(positions) else exp_end+1
+        h = next_heading_between(base_doc, line_i+1, next_line-1)
+        boundary_end = (h-1) if h is not None else (next_line-1)
+        role_metrics = harvest_metrics_from_block(base_doc, line_i, boundary_end)
         jd_metrics = extract_numeric_phrases(job_desc)
         seen=set()
         merged=[x for x in role_metrics + jd_metrics if (x not in seen and not seen.add(x))][:20]
         metrics_by_company[comp] = merged
-    # Ensure keys exist for all companies
+    # ensure every company key exists
     for e in experience:
         comp = sanitize(e.get("company",""))
         metrics_by_company.setdefault(comp, extract_numeric_phrases(job_desc))
 
-    # --- Generate bullets (batch)
+    # generate bullets
     bullets_by_company = gpt_bullets_batch(experience, job_desc, style_rules, metrics_by_company)
 
-    # --- Skills map
+    # skills map (JD-driven)
+    SKILL_BANK = {
+        "Business Analysis & Delivery": [
+            "Requirements elicitation","User stories","Acceptance criteria","UAT","BPMN","UML",
+            "Process re-engineering","Traceability (RTM)","Fit–gap","Prioritization (RICE, MoSCoW)"
+        ],
+        "Project & Program Management": [
+            "Agile Scrum","Kanban","SDLC","RACI","RAID","Sprint planning","Roadmapping","Stakeholder management"
+        ],
+        "Data, Analytics & BI": [
+            "SQL","Python","Pandas","NumPy","Power BI","Tableau","A/B testing","Forecasting","Anomaly detection"
+        ],
+        "Cloud, Data & MLOps": [
+            "AWS Lambda","S3","Redshift","Airflow","dbt","Spark","Databricks","ETL/ELT orchestration"
+        ],
+        "AI, ML & GenAI": [
+            "LLMs","RAG","Prompt design","Hugging Face","FAISS","Model monitoring","Inference optimization"
+        ],
+        "Enterprise Platforms & Integration": [
+            "Salesforce","NetSuite","SAP","ServiceNow","REST APIs","Postman","Git","Azure DevOps","Jira"
+        ],
+        "Collaboration, Design & Stakeholder": [
+            "Miro","Figma","Lucidchart","Wireframing","Prototyping","Executive communication","Workshops"
+        ],
+    }
     desired_bank = {c: SKILL_BANK.get(c, []) for c in skills_categories}
+    def pick_skills(jd: str, bank: Dict[str, List[str]], top_k: int = 8) -> Dict[str, List[str]]:
+        jd_l = jd.lower(); out={}
+        for cat, items in bank.items():
+            hits=[]
+            for s in items:
+                pat = re.escape(s.lower()).replace(r"\ ", r"\s+")
+                if re.search(rf"(?<![A-Za-z0-9]){pat}(?![A-Za-z0-9])", jd_l):
+                    hits.append(s)
+            seen=set(); merged=[x for x in hits+items if (x not in seen and not seen.add(x))]
+            out[cat] = merged[:top_k]
+        return out
     skills_map = pick_skills(job_desc, desired_bank) if skills_categories else {}
 
-    # --- Edit DOCX
+    # edit DOCX
     doc = base_doc
     write_summary(doc, summary)
     inject_skills(doc, skills_map)
 
-    # If we found explicit positions, use them; else fallback to old scan
-    if found_positions:
-        inject_bullets_by_positions(doc, found_positions, bullets_by_company, exp_start, exp_end)
-    else:
-        # fallback: nothing matched; do nothing to bullets
-        app.logger.warning("No experience positions found; bullets not injected.")
+    if BULLETS_STRICT_REPLACE and positions:
+        inject_bullets_strict(doc, positions, bullets_by_company, exp_start, exp_end)
+    elif positions:
+        # non-strict: remove only contiguous bullet paragraphs under each role
+        for comp, line_i in reversed(positions):
+            j = line_i + 1
+            while j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
+                j += 1
+            if j-1 >= line_i+1:
+                delete_range(doc, line_i+1, j-1)
+            anchor = doc.paragraphs[line_i]
+            last = anchor
+            for b in bullets_by_company.get(comp, []):
+                last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
 
-    # --- Return file
+    # return file
     out = io.BytesIO(); doc.save(out); out.seek(0)
     resp = make_response(send_file(
         out,
@@ -716,7 +677,7 @@ def tailor():
     return resp
 
 # ---------------
-# Local dev entry
+# Local dev
 # ---------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
