@@ -30,7 +30,8 @@ def _get_client():
     if not OPENAI_API_KEY or not _openai_available:
         return None
     try:
-        return OpenAI(api_key=OPENAI_API_KEY)
+        # hard wall for the whole request; also cap retries
+        return OpenAI(api_key=OPENAI_API_KEY, timeout=15.0, max_retries=1)
     except Exception as e:
         app.logger.exception("OpenAI client init failed: %s", e)
         return None
@@ -39,19 +40,18 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
     client = _get_client()
     if client is None:
         return "Placeholder output (no OPENAI_API_KEY set)."
-    # Do NOT pass temperature (some models only allow default=1)
+    # Do NOT set temperature (some models reject non-default)
     try:
         resp = client.chat.completions.create(
             model=MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": prompt}],
+            timeout=15.0,  # per-call guard (in addition to client timeout)
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        app.logger.exception("OpenAI chat.completions error: %s", e)
-        return "Placeholder output due to model error."
+        app.logger.warning("OpenAI call failed; using placeholder: %s", e)
+        return "Placeholder output due to model timeout/error."
 
 def ensure_docx(doc_or_bytes):
     """Accept a python-docx Document, a file-like object, or raw bytes and return a Document."""
