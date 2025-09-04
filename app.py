@@ -39,12 +39,19 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
     client = _get_client()
     if client is None:
         return "Placeholder output (no OPENAI_API_KEY set)."
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
-        temperature=0.2
-    )
-    return resp.choices[0].message.content.strip()
+    # Do NOT pass temperature (some models only allow default=1)
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        app.logger.exception("OpenAI chat.completions error: %s", e)
+        return "Placeholder output due to model error."
 
 def ensure_docx(doc_or_bytes):
     """Accept a python-docx Document, a file-like object, or raw bytes and return a Document."""
