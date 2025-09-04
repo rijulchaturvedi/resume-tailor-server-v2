@@ -17,13 +17,12 @@ app.logger.setLevel(logging.INFO)
 # ----------------------------
 # Model / OpenAI settings
 # ----------------------------
-# Default to a fast/reliable model; override with OPENAI_MODEL=gpt-5 if you like.
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # override to gpt-5 if desired
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").lower() in ("1", "true", "yes")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").lower() not in ("0", "false", "no")
-OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))                 # hard wall (s) per call
+OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))                 # hard wall (s) per model call
 OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20")) # SDK client timeout (s)
 
 try:
@@ -242,8 +241,9 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
     s, e = sec
 
     # Parse existing categories and item lines between s+1..e
-    existing_map: Dict[str, Tuple[int, set]] = {}
+    existing_map: Dict[str, Tuple[Optional[int], set]] = {}
     current_cat = None
+    last_seen_items_idx = None
     for idx in range(s + 1, e + 1):
         line = sanitize(doc.paragraphs[idx].text)
         if not line:
@@ -251,14 +251,16 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
         if line.endswith(":"):
             current_cat = line[:-1].strip()
             existing_map.setdefault(current_cat, (None, set()))
+            last_seen_items_idx = None
         else:
             if current_cat is not None:
                 items = [x.strip() for x in line.split(",") if x.strip()]
                 pi, aset = existing_map[current_cat]
                 aset.update(items)
                 existing_map[current_cat] = (idx, aset)
+                last_seen_items_idx = idx
 
-    # Append or create categories
+    # Append or create categories WITHOUT relying on doc.paragraphs.index(...)
     for cat, additions in new_skills.items():
         additions = [x for x in additions if x]
         if not additions:
@@ -270,6 +272,7 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
             if not to_add:
                 continue
             if items_idx is not None:
+                # Append to existing items line
                 para = doc.paragraphs[items_idx]
                 current = sanitize(para.text)
                 joiner = (", " if current and not current.endswith(",") else "")
@@ -277,23 +280,26 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
                 aset.update(to_add)
                 existing_map[cat] = (items_idx, aset)
             else:
-                # Find category header line
+                # Category header exists but no items line captured — insert a new items line after the header
                 cat_idx = None
-                for idx in range(s + 1, e + 1):
+                for idx in range(s + 1, len(doc.paragraphs)):
                     if sanitize(doc.paragraphs[idx].text).strip().lower() == f"{cat.lower()}:":
                         cat_idx = idx
                         break
+                    if is_heading(doc.paragraphs[idx].text):
+                        break
                 anchor = doc.paragraphs[cat_idx] if cat_idx is not None else doc.paragraphs[e]
-                newp = insert_paragraph_after(anchor, ", ".join(to_add))
-                existing_map[cat] = (doc.paragraphs.index(newp), set(to_add))
+                insert_paragraph_after(anchor, ", ".join(to_add))
+                # No need to store indices; we don't use them downstream
         else:
             # New category → append header + items at end of the section
+            # Recompute section end each time in case the doc changed
             sec = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"])
-            s, e = sec
+            s, e = sec if sec else (0, len(doc.paragraphs)-1)
             anchor = doc.paragraphs[e]
             header = insert_paragraph_after(anchor, f"{cat}:")
-            items_p = insert_paragraph_after(header, ", ".join(additions))
-            existing_map[cat] = (doc.paragraphs.index(items_p), set(additions))
+            insert_paragraph_after(header, ", ".join(additions))
+            # No indices stored to avoid identity mismatch errors
 
 def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
     """
