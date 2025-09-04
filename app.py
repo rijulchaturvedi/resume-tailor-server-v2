@@ -31,8 +31,9 @@ def _env_bool(name: str, default: bool=False) -> bool:
     return v.strip().lower() in ("1","true","yes","y","on")
 
 # Per-request toggles (also read from JSON)
+# DEFAULT STRICT REPLACE = ON so it actually replaces even if the extension forgets to send options.
 SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
-BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", False)
+BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
 
 try:
     from openai import OpenAI
@@ -45,7 +46,7 @@ except Exception:
 # ----------------------------
 def sanitize(text: str) -> str:
     if not text: return ""
-    # normalize non-breaking spaces & tabs first
+    # normalize NBSP & tabs
     text = text.replace("\u00A0", " ").replace("\t", " ")
     # normalize dashes/quotes
     text = text.replace("—","-").replace("–","-")
@@ -105,7 +106,7 @@ def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional
         try:
             new_para.style = style
         except KeyError:
-            # Fallback to bullet glyph if style missing
+            # Fallback bullet glyph if style missing
             if run and style.lower().startswith("list") and not run.text.strip().startswith("•"):
                 run.text = f"• {run.text}"
     return new_para
@@ -179,7 +180,7 @@ def company_aliases(company: str) -> List[str]:
         aliases.add(" ".join(core_words[:2]))
     return [a for a in aliases if a]
 
-MONTHS = r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|June|July|August|September|October|November|December"
+MONTHS = r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December"
 ROLE_LINE_RE = re.compile(rf"\b({MONTHS})\b\s+\d{{4}}\s*-\s*(Present|\b({MONTHS})\b\s+\d{{4}})", re.IGNORECASE)
 
 def scan_role_headers(doc: Document, exp_start: int, exp_end: int) -> List[Tuple[int, str, str]]:
@@ -216,7 +217,7 @@ def map_experience_to_positions(experience: List[Dict], headers: List[Tuple[int,
         if best is not None:
             used.add(best); positions.append((comp, best))
         else:
-            app.logger.warning("No header match for '%s' / role '%s'", comp, role)
+            app.logger.info("No header match for '%s' / role '%s'", comp, role)
     positions.sort(key=lambda x: x[1])
     return positions
 
@@ -225,6 +226,21 @@ def next_heading_between(doc: Document, a: int, b: int) -> Optional[int]:
         if is_heading(doc.paragraphs[j].text):
             return j
     return None
+
+# Fallback: if a role header wasn’t detected, anchor by role+company text (no dates required)
+def find_role_anchor_by_text(doc: Document, exp_start: int, exp_end: int, company: str, role: str) -> Optional[int]:
+    aliases = company_aliases(company)
+    role_toks = set(norm_tokens(role))
+    best_idx, best_hits = None, -1
+    for i in range(exp_start+1, exp_end+1):
+        line = sanitize(doc.paragraphs[i].text).lower()
+        if not line: continue
+        if any(a and a in line for a in aliases):
+            hits = len(role_toks & set(norm_tokens(line)))
+            if hits > best_hits:
+                best_hits = hits
+                best_idx = i
+    return best_idx
 
 # ----------------------------
 # Metrics (resume + JD)
@@ -490,7 +506,7 @@ def inject_bullets_strict(doc: Document,
         if boundary_end >= line_i + 1:
             delete_range(doc, line_i + 1, boundary_end)
 
-        # insert bullets
+        # insert bullets right below header
         anchor = doc.paragraphs[line_i]
         last = anchor
         for b in bullets_by_company.get(comp, []):
@@ -501,7 +517,7 @@ def inject_bullets_strict(doc: Document,
 # ----------------------------
 @app.route("/")
 def index():
-    return jsonify({"ok": True, "service": "resume-tailor-server", "endpoints": ["/health", "/tailor"]})
+    return jsonify({"ok": True, "service": "resume-tailor-server", "endpoints": ["/health", "/tailor"]])
 
 @app.route("/health")
 def health():
@@ -528,10 +544,10 @@ def tailor():
             return make_response(("invalid json", 400))
         base_resume_file = None
 
-    # Refresh toggles per request
+    # Refresh toggles per request (default strict replace = True)
     global SHOW_KPI_PLACEHOLDER, BULLETS_STRICT_REPLACE
     SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
-    BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", False)
+    BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
     opts = (data.get("options") or {})
     if "show_kpi_placeholder" in opts: SHOW_KPI_PLACEHOLDER = bool(opts["show_kpi_placeholder"])
     if "strict_replace" in opts: BULLETS_STRICT_REPLACE = bool(opts["strict_replace"])
@@ -575,7 +591,18 @@ def tailor():
     headers = scan_role_headers(base_doc, exp_start, exp_end)
     positions = map_experience_to_positions(experience, headers)
 
-    # Fallback mapping by order if fuzzy matching missed anything
+    # Fallback 1: anchor by role+company text (no date needed)
+    if experience:
+        claimed = {idx for _, idx in positions}
+        for e in experience:
+            comp = sanitize(e.get("company","")); role = sanitize(e.get("role",""))
+            if any(p[0] == comp for p in positions):
+                continue
+            anchor = find_role_anchor_by_text(base_doc, exp_start, exp_end, comp, role)
+            if anchor is not None and anchor not in claimed:
+                positions.append((comp, anchor)); claimed.add(anchor)
+
+    # Fallback 2: pair remaining experiences by order to remaining detected headers
     if headers:
         used_idxs = {i for _, i in positions}
         free_headers = [h for h in headers if h[0] not in used_idxs]
@@ -584,7 +611,8 @@ def tailor():
         for k in range(fill):
             comp_name = sanitize(need[k].get("company",""))
             positions.append((comp_name, free_headers[k][0]))
-        positions.sort(key=lambda x: x[1])
+    positions.sort(key=lambda x: x[1])
+    app.logger.info("Final mapped positions: %s", positions)
 
     # Build metrics per mapped role (resume block + JD)
     metrics_by_company: Dict[str, List[str]] = {}
@@ -597,12 +625,11 @@ def tailor():
         seen=set()
         merged=[x for x in role_metrics + jd_metrics if (x not in seen and not seen.add(x))][:20]
         metrics_by_company[comp] = merged
-    # default metrics if some company had no mapped header
     for e in experience:
         comp = sanitize(e.get("company",""))
         metrics_by_company.setdefault(comp, extract_numeric_phrases(job_desc))
 
-    # Generate bullets (one call)
+    # Generate bullets (single call)
     bullets_by_company = gpt_bullets_batch(experience, job_desc, style_rules, metrics_by_company)
 
     # Skills map (JD-driven)
@@ -649,10 +676,11 @@ def tailor():
     inject_skills(doc, skills_map)
 
     if positions:
-        # Always do strict replace when requested; otherwise remove contiguous bullets only
+        # Strict replace is ON by default
         if BULLETS_STRICT_REPLACE:
             inject_bullets_strict(doc, positions, bullets_by_company, exp_start, exp_end)
         else:
+            # non-strict: clear contiguous bullets only
             for comp, line_i in reversed(positions):
                 j = line_i + 1
                 while j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
@@ -664,7 +692,7 @@ def tailor():
                 for b in bullets_by_company.get(comp, []):
                     last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
     else:
-        app.logger.warning("No role headers detected; bullets not injected.")
+        app.logger.warning("No role headers detected or mapped; bullets not injected.")
 
     # Return file
     out = io.BytesIO(); doc.save(out); out.seek(0)
