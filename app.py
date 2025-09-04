@@ -17,13 +17,17 @@ app.logger.setLevel(logging.INFO)
 # ----------------------------
 # Model / OpenAI settings
 # ----------------------------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # override to gpt-5 if desired
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # override with gpt-5 if desired
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").lower() in ("1", "true", "yes")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").lower() not in ("0", "false", "no")
 OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))                 # hard wall (s) per model call
 OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20")) # SDK client timeout (s)
+
+# Behavior toggles
+SHOW_KPI_PLACEHOLDER = os.getenv("SHOW_KPI_PLACEHOLDER", "1").lower() in ("1", "true", "yes")
+BULLETS_STRICT_REPLACE = os.getenv("BULLETS_STRICT_REPLACE", "0").lower() in ("1", "true", "yes")
 
 try:
     from openai import OpenAI
@@ -96,7 +100,7 @@ def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional
         try:
             new_para.style = style
         except KeyError:
-            if run and style.lower().startswith("list"):
+            if run and style.lower().startswith("list"):  # e.g., "List Bullet"
                 if not run.text.strip().startswith("•"):
                     run.text = f"• {run.text}"
     return new_para
@@ -127,6 +131,8 @@ QUANT_REGEX = re.compile(
 )
 
 def ensure_quantified(bullets: List[str], placeholder: str = "quantified impact: KPI TBD") -> List[str]:
+    if not SHOW_KPI_PLACEHOLDER:
+        return [sanitize(b) for b in bullets]
     out = []
     for b in bullets:
         t = sanitize(b)
@@ -152,6 +158,34 @@ def is_bullet_para(p) -> bool:
     if re.match(r"^\s*\d+[\.\)]\s+", t):
         return True
     return False
+
+# ----------------------------
+# Metric harvesting (from resume blocks + JD)
+# ----------------------------
+NUM_PHRASE_REGEX = re.compile(
+    r"(\$?\d+(?:\.\d+)?\s?(?:k|m|bn|b|million|billion)?|\d+\s?(?:%|percent)|\d+\+\b|"
+    r"\b\d+\s?(?:days?|weeks?|months?|years?)|\$\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d{1,3}%|\d{1,3}\s?%)",
+    re.IGNORECASE
+)
+
+def extract_numeric_phrases(text: str, max_phrases: int = 12) -> List[str]:
+    found = []
+    for m in NUM_PHRASE_REGEX.finditer(text or ""):
+        val = sanitize(m.group(0))
+        if val and val not in found:
+            found.append(val)
+        if len(found) >= max_phrases:
+            break
+    return found
+
+def harvest_metrics_from_role_block(doc: Document, start_idx: int, end_idx: int) -> List[str]:
+    buf = []
+    for i in range(start_idx + 1, min(end_idx + 1, len(doc.paragraphs))):
+        t = sanitize(doc.paragraphs[i].text)
+        if not t or is_heading(t):
+            break
+        buf.append(t)
+    return extract_numeric_phrases("  ".join(buf))
 
 # ----------------------------
 # OpenAI helpers (fail-safe)
@@ -227,8 +261,7 @@ def write_summary(doc: Document, summary: str):
 
 def inject_skills(doc: Document, new_skills: Dict[str, list]):
     """
-    Keep existing skills content; append new items per category (dedup).
-    If section doesn't exist, create SKILLS & TOOLS. Categories are lines ending with ":".
+    Keep existing skills; merge duplicate category headers; append new items (dedup) into the first occurrence.
     """
     if not new_skills:
         return
@@ -240,70 +273,106 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
         sec = find_section_bounds(doc, ["SKILLS & TOOLS", "SKILLS AND TOOLS"])
     s, e = sec
 
-    # Parse existing categories and item lines between s+1..e
-    existing_map: Dict[str, Tuple[Optional[int], set]] = {}
+    # Pass 1: map first occurrence per category; collect duplicates to delete
+    def norm_cat_name(name: str) -> str:
+        return _norm_heading(name).replace("  ", " ").strip()
+
+    first_idx: Dict[str, Dict[str, object]] = {}  # norm_cat -> {header:int, items_idx:Optional[int], items:set}
+    to_delete: List[Tuple[int, int]] = []
+
     current_cat = None
-    last_seen_items_idx = None
+    current_header_idx = None
     for idx in range(s + 1, e + 1):
         line = sanitize(doc.paragraphs[idx].text)
         if not line:
             continue
         if line.endswith(":"):
-            current_cat = line[:-1].strip()
-            existing_map.setdefault(current_cat, (None, set()))
-            last_seen_items_idx = None
+            key = norm_cat_name(line[:-1].strip())
+            if key not in first_idx:
+                first_idx[key] = {"header": idx, "items_idx": None, "items": set()}
+                current_cat = key
+                current_header_idx = idx
+            else:
+                # duplicate header: mark it (and its following items line if present) for deletion
+                dup_start = idx
+                dup_end = idx
+                if idx + 1 <= e:
+                    nxt = sanitize(doc.paragraphs[idx + 1].text)
+                    if nxt and not nxt.endswith(":") and not is_heading(nxt):
+                        dup_end = idx + 1
+                        # merge its items into the first occurrence set
+                        items = [x.strip() for x in nxt.split(",") if x.strip()]
+                        first_idx[key]["items"].update(items)
+                to_delete.append((dup_start, dup_end))
+                current_cat = None
+                current_header_idx = None
         else:
             if current_cat is not None:
                 items = [x.strip() for x in line.split(",") if x.strip()]
-                pi, aset = existing_map[current_cat]
-                aset.update(items)
-                existing_map[current_cat] = (idx, aset)
-                last_seen_items_idx = idx
+                first_idx[current_cat]["items"].update(items)
+                if first_idx[current_cat]["items_idx"] is None:
+                    first_idx[current_cat]["items_idx"] = idx
 
-    # Append or create categories WITHOUT relying on doc.paragraphs.index(...)
+    # Delete duplicates bottom-up
+    for a, b in sorted(to_delete, key=lambda x: x[0], reverse=True):
+        delete_range(doc, a, b)
+        e -= (b - a + 1)
+
+    # Pass 2: write back merged items for existing categories
+    for key, meta in first_idx.items():
+        h = int(meta["header"])
+        it = meta["items_idx"]
+        items_sorted = list(meta["items"])
+        if items_sorted:
+            if it is not None and it < len(doc.paragraphs):
+                para = doc.paragraphs[it]
+                para.text = ", ".join(items_sorted)
+            else:
+                header_para = doc.paragraphs[h]
+                insert_paragraph_after(header_para, ", ".join(items_sorted))
+
+    # Pass 3: append new skills per incoming categories
     for cat, additions in new_skills.items():
         additions = [x for x in additions if x]
         if not additions:
             continue
-
-        if cat in existing_map:
-            items_idx, aset = existing_map[cat]
-            to_add = [x for x in additions if x not in aset]
-            if not to_add:
-                continue
-            if items_idx is not None:
-                # Append to existing items line
-                para = doc.paragraphs[items_idx]
-                current = sanitize(para.text)
-                joiner = (", " if current and not current.endswith(",") else "")
-                para.text = f"{current}{joiner}{', '.join(to_add)}"
-                aset.update(to_add)
-                existing_map[cat] = (items_idx, aset)
+        key = norm_cat_name(cat)
+        if key in first_idx:
+            # Append dedup to first occurrence items
+            h = int(first_idx[key]["header"])
+            # Find existing items line right after header (if any) again
+            target_items_idx = None
+            if first_idx[key]["items_idx"] is not None:
+                target_items_idx = int(first_idx[key]["items_idx"])
             else:
-                # Category header exists but no items line captured — insert a new items line after the header
-                cat_idx = None
-                for idx in range(s + 1, len(doc.paragraphs)):
-                    if sanitize(doc.paragraphs[idx].text).strip().lower() == f"{cat.lower()}:":
-                        cat_idx = idx
-                        break
-                    if is_heading(doc.paragraphs[idx].text):
-                        break
-                anchor = doc.paragraphs[cat_idx] if cat_idx is not None else doc.paragraphs[e]
-                insert_paragraph_after(anchor, ", ".join(to_add))
-                # No need to store indices; we don't use them downstream
+                # search next line
+                if h + 1 < len(doc.paragraphs):
+                    maybe = sanitize(doc.paragraphs[h + 1].text)
+                    if maybe and not maybe.endswith(":") and not is_heading(maybe):
+                        target_items_idx = h + 1
+
+            if target_items_idx is not None and target_items_idx < len(doc.paragraphs):
+                para = doc.paragraphs[target_items_idx]
+                existing = [x.strip() for x in sanitize(para.text).split(",") if x.strip()]
+                add = [x for x in additions if x not in existing]
+                if add:
+                    joiner = (", " if para.text and not para.text.strip().endswith(",") else "")
+                    para.text = f"{sanitize(para.text)}{joiner}{', '.join(add)}"
+            else:
+                header_para = doc.paragraphs[h]
+                insert_paragraph_after(header_para, ", ".join(additions))
         else:
-            # New category → append header + items at end of the section
-            # Recompute section end each time in case the doc changed
-            sec = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"])
-            s, e = sec if sec else (0, len(doc.paragraphs)-1)
-            anchor = doc.paragraphs[e]
+            # New category → append header + items at end of section
+            sec2 = find_section_bounds(doc, ["SKILLS", "CORE SKILLS", "TECHNICAL SKILLS", "SKILLS & TOOLS", "SKILLS AND TOOLS"])
+            s2, e2 = sec2 if sec2 else (0, len(doc.paragraphs) - 1)
+            anchor = doc.paragraphs[e2]
             header = insert_paragraph_after(anchor, f"{cat}:")
             insert_paragraph_after(header, ", ".join(additions))
-            # No indices stored to avoid identity mismatch errors
 
 def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
     """
-    Replace only the existing bullet paragraphs under each company with the new ones.
+    Replace bullets under each company. If BULLETS_STRICT_REPLACE=1, remove ALL non-heading, non-empty
+    lines under the role until a blank/heading; otherwise, remove only bullet-styled paragraphs.
     """
     if not bullets_by_company:
         return
@@ -319,12 +388,18 @@ def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
             i += 1
             continue
 
-        # Identify contiguous bullet paragraphs directly under this line
         j = i + 1
-        while j <= end_idx and j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
-            j += 1
+        if BULLETS_STRICT_REPLACE:
+            while j <= end_idx and j < len(doc.paragraphs):
+                txt = sanitize(doc.paragraphs[j].text)
+                if not txt or is_heading(txt):
+                    break
+                j += 1
+        else:
+            while j <= end_idx and j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
+                j += 1
 
-        # Delete ONLY the bullet block (if any)
+        # Delete the identified block
         if j - 1 >= i + 1:
             delete_range(doc, i + 1, j - 1)
             removed = (j - 1) - (i + 1) + 1
@@ -334,9 +409,8 @@ def inject_bullets(doc: Document, bullets_by_company: Dict[str, list]):
         anchor = doc.paragraphs[i]
         last = anchor
         for b in bullets_by_company.get(match_comp, []):
-            last = insert_paragraph_after(last, sanitize(b), style="List Bullet")  # safe fallback inside
+            last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
 
-        # Move past the newly inserted bullets
         i = i + 1 + len(bullets_by_company.get(match_comp, []))
 
 # ----------------------------
@@ -382,12 +456,17 @@ def pick_skills(jd: str, bank: Dict[str, List[str]], top_k: int = 8) -> Dict[str
     return out
 
 # ----------------------------
-# Batch bullets (1 model call, quantified)
+# Batch bullets (1 model call, uses harvested metrics)
 # ----------------------------
-def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str]) -> Dict[str, List[str]]:
+def gpt_bullets_batch(
+    experience: List[Dict],
+    jd: str,
+    style_rules: List[str],
+    metrics_by_company: Dict[str, List[str]]
+) -> Dict[str, List[str]]:
     """
-    Single model call; returns {company: [bullets]}.
-    Enforces quantification where truthful; never fabricates numbers—adds a KPI marker if absent.
+    Returns {company: [bullets]} using only provided figures (resume/JD) when possible.
+    If no figure fits, optional KPI marker is appended (SHOW_KPI_PLACEHOLDER).
     """
     entries = []
     for e in experience:
@@ -396,7 +475,10 @@ def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str]) -
             continue
         comp = sanitize(e.get("company", ""))
         role = sanitize(e.get("role", ""))
-        entries.append(f'- company: "{comp}"; role: "{role}"; bullets: {k}')
+        mx = metrics_by_company.get(comp, [])
+        # We inline metrics as a hint list; model should weave them naturally (and only if truthful)
+        metrics_str = ", ".join(mx) if mx else ""
+        entries.append(f'- company: "{comp}"; role: "{role}"; bullets: {k}; metrics: [{metrics_str}]')
     if not entries:
         return {sanitize(e.get("company","")): [] for e in experience}
 
@@ -404,14 +486,15 @@ def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str]) -
         "\n".join(f"- {r}" for r in style_rules) if style_rules else
         "- 20–28 words each\n"
         "- Start with a strong verb; past tense\n"
-        "- Include at least one quantifier when truthful (%, $, #, time, count); prefer real figures from the JD\n"
-        "- If no truthful figure exists, mark with 'KPI TBD' instead of inventing numbers\n"
+        "- Prefer the provided metrics; use them naturally (%, $, counts, time)\n"
+        "- Do NOT invent numbers; if none apply, leave unnumbered\n"
         "- No company names inside bullets\n"
         "- Avoid buzzwords; focus on actions and outcomes"
     )
 
     prompt = f"""Return ONLY JSON (no code fences) mapping company name to an array of bullet strings.
-Entries:
+
+Entries (each entry may include 'metrics' that you can use verbatim):
 {chr(10).join(entries)}
 
 Rules:
@@ -429,7 +512,7 @@ JSON schema example:
 }}"""
 
     text = gpt(prompt, system="You produce strict JSON only. No commentary.")
-    # Try parse; if fail, build placeholders
+    # Parse or fallback
     try:
         data = json.loads(text)
     except Exception:
@@ -438,15 +521,15 @@ JSON schema example:
             comp = sanitize(e.get("company",""))
             k = int(e.get("bullets", 0) or 0)
             role = sanitize(e.get("role",""))
-            data[comp] = [f"Delivered outcomes in '{role}' aligned to the JD (KPI TBD)" for _ in range(max(k,0))]
+            data[comp] = [f"Drove outcomes in '{role}' aligned to JD" for _ in range(max(k,0))]
 
-    # Normalize counts + sanitize + ensure quant signal
+    # Normalize + sanitize + optional KPI marker
     out = {}
     for e in experience:
         comp = sanitize(e.get("company",""))
         k = int(e.get("bullets", 0) or 0)
         bullets = [sanitize(b) for b in (data.get(comp) or [])][:k]
-        bullets = ensure_quantified(bullets)
+        bullets = ensure_quantified(bullets)  # add KPI marker only if enabled and bullet lacks quant
         out[comp] = bullets
     return out
 
@@ -507,16 +590,37 @@ def tailor():
     )
     summary = sanitize(gpt(summary_prompt))
 
-    bullets_by_company: Dict[str, List[str]] = gpt_bullets_batch(experience, job_desc, style_rules)
+    # Build metrics_by_company from resume role blocks + JD
+    metrics_by_company: Dict[str, List[str]] = {}
+    exp_sec = find_section_bounds(base_doc, ["EXPERIENCE", "WORK EXPERIENCE"])
+    start_idx = exp_sec[0] if exp_sec else 0
+    end_idx = exp_sec[1] if exp_sec else len(base_doc.paragraphs) - 1
 
+    for e in experience:
+        comp = sanitize(e.get("company",""))
+        comp_idx = None
+        for i in range(start_idx, end_idx + 1):
+            if comp and comp.lower() in sanitize(base_doc.paragraphs[i].text).lower():
+                comp_idx = i
+                break
+        role_metrics = harvest_metrics_from_role_block(base_doc, comp_idx if comp_idx is not None else start_idx, end_idx) if comp_idx is not None else []
+        jd_metrics = extract_numeric_phrases(job_desc)
+        seen = set()
+        merged = [x for x in role_metrics + jd_metrics if (x not in seen and not seen.add(x))][:20]
+        metrics_by_company[comp] = merged
+
+    # Batch bullets (quant-friendly, metrics-aware)
+    bullets_by_company: Dict[str, List[str]] = gpt_bullets_batch(experience, job_desc, style_rules, metrics_by_company)
+
+    # Skills grouping (JD-driven) — keep existing + append deduped, merge duplicate headers
     desired_bank = {c: SKILL_BANK.get(c, []) for c in skills_categories}
     skills_map = pick_skills(job_desc, desired_bank) if skills_categories else {}
 
     # --- Edit DOCX
     doc = base_doc
     write_summary(doc, summary)
-    inject_skills(doc, skills_map)          # keep originals; append deduped
-    inject_bullets(doc, bullets_by_company) # replace bullet block only
+    inject_skills(doc, skills_map)          # keep originals; merge & append deduped
+    inject_bullets(doc, bullets_by_company) # replace under each role (strict mode optional)
 
     # --- Return DOCX
     out = io.BytesIO()
