@@ -8,7 +8,7 @@ from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 # ----------------------------
-# App & CORS
+# App & CORS (Chrome extension → /tailor)
 # ----------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/tailor": {"origins": "chrome-extension://*"}})
@@ -17,7 +17,7 @@ app.logger.setLevel(logging.INFO)
 # ----------------------------
 # Model / OpenAI settings
 # ----------------------------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # or "gpt-5"
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # set to "gpt-5" if you wish
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").strip().lower() in ("1", "true", "yes")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
@@ -30,7 +30,7 @@ def _env_bool(name: str, default: bool=False) -> bool:
     if v is None: return default
     return v.strip().lower() in ("1","true","yes","y","on")
 
-# Behavior toggles (can be overridden per-request via options)
+# Behavior toggles (overridable via JSON options)
 SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
 BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)  # strict ON by default
 
@@ -51,6 +51,14 @@ def sanitize(text: str) -> str:
     text = re.sub(r"[\u2018\u2019]", "'", text)
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
+
+def _canon(s: str) -> str:
+    # Normalization used for exact matching
+    s = sanitize(s).lower()
+    s = s.replace("\u00a0", " ")
+    s = s.replace("—", "-").replace("–", "-")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def _norm_heading(text: str) -> str:
     t = sanitize(text).upper()
@@ -87,7 +95,7 @@ def find_section_bounds(doc: Document, titles: List[str]) -> Optional[Tuple[int,
     return (start, end)
 
 def find_all_section_bounds(doc: Document, titles: List[str]) -> List[Tuple[int,int]]:
-    """Find all occurrences of a titled section (useful when SKILLS appears twice)."""
+    """Find all occurrences of a titled section (e.g., multiple SKILLS blocks)."""
     spans = []
     i = 0
     titles_up = {_norm_heading(t) for t in titles}
@@ -172,17 +180,8 @@ def is_bullet_para(p) -> bool:
     return False
 
 # ----------------------------
-# Company/role detection
+# Role/header detection
 # ----------------------------
-STOPWORDS = {"inc","llc","llp","ltd","plc","corp","co","company","university","the"}
-
-def norm_tokens(s: str) -> List[str]:
-    s = sanitize(s).lower()
-    s = re.sub(r"\(.*?\)", "", s)
-    s = re.sub(r"[^a-z0-9\s&\-]", " ", s)
-    toks = [t for t in s.split() if t and t not in STOPWORDS]
-    return toks
-
 MONTHS = r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December"
 ROLE_LINE_RE = re.compile(rf"\b({MONTHS})\b\s+\d{{4}}\s*-\s*(Present|\b({MONTHS})\b\s+\d{{4}})", re.IGNORECASE)
 
@@ -190,11 +189,9 @@ def looks_like_role_header(line: str) -> bool:
     t = sanitize(line)
     if not t: return False
     if ROLE_LINE_RE.search(t): return True
-    # Fuzzy: header-ish if it has commas (role, company, location) and bullets appear right after
-    return "," in t
+    return "," in t  # role, company, location pattern is common
 
 def scan_role_headers_strict(doc: Document, exp_start: int, exp_end: int) -> List[int]:
-    """Date-span headers only."""
     idxs = []
     for i in range(exp_start+1, exp_end+1):
         t = sanitize(doc.paragraphs[i].text)
@@ -203,7 +200,6 @@ def scan_role_headers_strict(doc: Document, exp_start: int, exp_end: int) -> Lis
     return idxs
 
 def scan_role_headers_fuzzy(doc: Document, exp_start: int, exp_end: int) -> List[int]:
-    """Also treat lines as headers if bullets follow within 1–2 lines."""
     idxs = set(scan_role_headers_strict(doc, exp_start, exp_end))
     for i in range(exp_start+1, exp_end+1):
         t = sanitize(doc.paragraphs[i].text)
@@ -332,7 +328,6 @@ def parse_skills_section(doc: Document, s: int, e: int):
             if current not in mapping:
                 mapping[current] = []
                 order.append(current)
-            # see if next line has items
             j = i + 1
             if j <= e:
                 items_line = sanitize(doc.paragraphs[j].text)
@@ -353,7 +348,6 @@ def parse_skills_section(doc: Document, s: int, e: int):
         if current:
             mapping[current].extend([x.strip() for x in line.split(",") if x.strip()])
         i += 1
-    # Dedup
     for k,v in mapping.items():
         vv=[]; seen=set()
         for x in v:
@@ -377,13 +371,11 @@ def rewrite_skills_section(doc: Document, s: int, e: int, order: List[str], mapp
 
 def inject_skills(doc: Document, new_skills: Dict[str, list]):
     if not new_skills: return
-    # Merge ALL skills sections (if multiple) into one canonical block
+    # Merge all skills sections into one canonical block
     spans = find_all_section_bounds(doc, ["SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS"])
     if not spans:
         h = doc.add_paragraph(); h.add_run("SKILLS & TOOLS").bold = True
         spans = find_all_section_bounds(doc, ["SKILLS & TOOLS","SKILLS AND TOOLS"])
-
-    # Union the content across all spans
     first_s = spans[0][0]
     last_e = spans[-1][1]
     order, mapping = parse_skills_section(doc, first_s, last_e)
@@ -400,11 +392,23 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
                 mapping[key].append(t)
                 existing.add(t.lower())
 
-    # Rewrite once (collapses duplicates)
     rewrite_skills_section(doc, first_s, last_e, order, mapping)
 
 # ----------------------------
-# Bullets: generate & inject
+# Exact-header anchoring (your ask)
+# ----------------------------
+def find_exact_anchor(doc: Document, exp_start: int, exp_end: int, header_text: str) -> Optional[int]:
+    target = _canon(header_text)
+    if not target:
+        return None
+    for i in range(exp_start+1, min(exp_end+1, len(doc.paragraphs))):
+        line = _canon(doc.paragraphs[i].text)
+        if line == target or target in line:
+            return i
+    return None
+
+# ----------------------------
+# GPT bullets
 # ----------------------------
 def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str], metrics_by_company: Dict[str, List[str]]) -> Dict[str, List[str]]:
     entries = []
@@ -461,36 +465,6 @@ JSON schema example:
         out[comp] = ensure_quantified(bullets)
     return out
 
-def inject_bullets_strict(doc: Document,
-                          headers: List[int],
-                          company_order: List[str],
-                          bullets_by_company: Dict[str, List[str]],
-                          exp_end: int):
-    """
-    Strict replace by order:
-      - We already detected header lines (date- or bullet-follow heuristic).
-      - Map experiences to headers by order, delete each block body, and insert new bullets under the header.
-    """
-    # Map experiences (company_order) to header indices by order
-    pairings: List[Tuple[str, int]] = []
-    for idx, comp in enumerate(company_order):
-        if idx < len(headers):
-            pairings.append((comp, headers[idx]))
-
-    # Bottom-up delete+insert keeps indices stable
-    for i in range(len(pairings)-1, -1, -1):
-        comp, start_i = pairings[i]
-        next_start = pairings[i+1][1] if i+1 < len(pairings) else None
-        boundary_end = find_block_end(doc, start_i, next_start, exp_end)
-
-        if boundary_end >= start_i + 1:
-            delete_range(doc, start_i + 1, boundary_end)
-
-        anchor = doc.paragraphs[start_i]
-        last = anchor
-        for b in bullets_by_company.get(comp, []):
-            last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
-
 # ----------------------------
 # Routes
 # ----------------------------
@@ -533,6 +507,12 @@ def tailor():
     app.logger.info("Toggles -> strict_replace=%s, show_kpi_placeholder=%s",
                     BULLETS_STRICT_REPLACE, SHOW_KPI_PLACEHOLDER)
 
+    # Exact headers map (keys = company, values = exact visible header line in DOCX)
+    exact_headers: Dict[str, str] = {}
+    if "exact_headers" in opts and isinstance(opts["exact_headers"], dict):
+        exact_headers = { sanitize(k): v for k,v in opts["exact_headers"].items() if v }
+
+    # Inputs
     job_desc = sanitize((data or {}).get("job_description",""))
     cfg = (data or {}).get("resume_config",{}) or {}
     summary_sentences = int(cfg.get("summary_sentences", 2))
@@ -557,7 +537,7 @@ def tailor():
     )
     summary = sanitize(gpt(summary_prompt))
 
-    # Experience bounds
+    # Experience section bounds
     exp_sec = (find_section_bounds(base_doc, ["PROFESSIONAL EXPERIENCE"])
                or find_section_bounds(base_doc, ["WORK EXPERIENCE"])
                or find_section_bounds(base_doc, ["EXPERIENCE"]))
@@ -566,34 +546,59 @@ def tailor():
     else:
         exp_start, exp_end = exp_sec
 
-    # Detect header lines (robust)
-    headers = scan_role_headers_fuzzy(base_doc, exp_start, exp_end)
-    app.logger.info("Detected role headers at indices: %s", headers)
+    # ---- Anchor detection: exact → fuzzy fallback
+    anchors: List[Tuple[str,int]] = []
+    used_indices = set()
+    for e in experience:
+        k = int(e.get("bullets", 0) or 0)
+        if k <= 0:
+            continue
+        comp = sanitize(e.get("company",""))
+        role = sanitize(e.get("role",""))
+        idx = None
+        # 1) exact header match if provided for this company
+        hdr = exact_headers.get(comp)
+        if hdr:
+            idx = find_exact_anchor(base_doc, exp_start, exp_end, hdr)
+            if idx is None:
+                app.logger.warning("Exact header not found for %s -> '%s'", comp, hdr)
+        # 2) fallback: fuzzy scan paired by order later
+        if idx is not None and idx not in used_indices:
+            anchors.append((comp, idx))
+            used_indices.add(idx)
 
-    # Company list by order (for pairing)
-    company_order = [sanitize(e.get("company","")) for e in experience if int(e.get("bullets",0) or 0) > 0]
+    # If we didn't get all, fallback to fuzzy headers by order
+    remaining_companies = [sanitize(e.get("company","")) for e in experience if int(e.get("bullets",0) or 0) > 0 and sanitize(e.get("company","")) not in {c for c,_ in anchors}]
+    if remaining_companies:
+        headers = scan_role_headers_fuzzy(base_doc, exp_start, exp_end)
+        headers = [h for h in headers if h not in used_indices]
+        # Pair by order
+        for i, comp in enumerate(remaining_companies):
+            if i < len(headers):
+                anchors.append((comp, headers[i]))
+                used_indices.add(headers[i])
+
+    anchors.sort(key=lambda x: x[1])
+    app.logger.info("Final anchors: %s", anchors)
 
     # Metrics (resume block + JD), keyed by company
     metrics_by_company: Dict[str, List[str]] = {}
-    for i, start_i in enumerate(headers):
-        next_start = headers[i+1] if i+1 < len(headers) else None
+    for i, (comp, start_i) in enumerate(anchors):
+        next_start = anchors[i+1][1] if i+1 < len(anchors) else None
         boundary_end = find_block_end(base_doc, start_i, next_start, exp_end)
         role_metrics = harvest_metrics_from_block(base_doc, start_i, boundary_end)
         jd_metrics = extract_numeric_phrases(job_desc)
         seen=set()
         merged=[x for x in role_metrics + jd_metrics if (x not in seen and not seen.add(x))][:20]
-        co = company_order[i] if i < len(company_order) else f"Company_{i+1}"
-        metrics_by_company[co] = merged
-    # Ensure all companies have at least JD metrics
-    for c in company_order:
-        metrics_by_company.setdefault(c, extract_numeric_phrases(job_desc))
+        metrics_by_company[comp] = merged
+    # Ensure companies without anchors at least get JD metrics for bullet gen
+    for e in experience:
+        comp = sanitize(e.get("company",""))
+        if comp not in metrics_by_company:
+            metrics_by_company[comp] = extract_numeric_phrases(job_desc)
 
     # Generate bullets (single call)
-    bullets_by_company = gpt_bullets_batch(
-        [{"company": c, "role": e.get("role",""), "bullets": e.get("bullets",0)} for c,e in
-         ((sanitize(x.get("company","")), x) for x in experience)],
-        job_desc, style_rules, metrics_by_company
-    )
+    bullets_by_company = gpt_bullets_batch(experience, job_desc, style_rules, metrics_by_company)
 
     # Skills (keep originals; append deduped)
     SKILL_BANK = {
@@ -605,7 +610,7 @@ def tailor():
             "Agile Scrum","Kanban","SDLC","RACI","RAID","Sprint planning","Roadmapping","Stakeholder management"
         ],
         "Data, Analytics & BI": [
-            "SQL","Python","Pandas","NumPy","Power BI","Tableau","A/B testing","Forecasting"
+            "SQL","Python","Pandas","NumPy","Power BI","Tableau","A/B testing","Forecasting","Anomaly detection"
         ],
         "Cloud, Data & MLOps": [
             "AWS Lambda","S3","Redshift","Airflow","dbt","Spark","Databricks","ETL/ELT orchestration"
@@ -631,36 +636,38 @@ def tailor():
             seen=set(); merged=[x for x in hits+items if (x not in seen and not seen.add(x))]
             out[cat] = merged[:top_k]
         return out
-    want_cats = skills_categories or list(SKILL_BANK.keys())
-    skills_map = pick_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in want_cats}) if want_cats else {}
+    skills_categories = skills_categories or list(SKILL_BANK.keys())
+    skills_map = pick_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories}) if skills_categories else {}
 
     # Apply edits
     doc = base_doc
     write_summary(doc, summary)
     inject_skills(doc, skills_map)
 
-    if headers and BULLETS_STRICT_REPLACE:
-        inject_bullets_strict(doc, headers, company_order, bullets_by_company, exp_end)
-    elif headers:
-        # Soft mode: clear only contiguous bullets after each header
-        for i in range(len(headers)-1, -1, -1):
-            start_i = headers[i]
-            next_start = headers[i+1] if i+1 < len(headers) else None
+    # Strict bullet replacement directly under each anchor header
+    if anchors:
+        # bottom-up for index stability
+        for idx in range(len(anchors)-1, -1, -1):
+            comp, start_i = anchors[idx]
+            next_start = anchors[idx+1][1] if idx+1 < len(anchors) else None
             boundary_end = find_block_end(doc, start_i, next_start, exp_end)
-            # wipe only bullet-like lines
-            j = start_i + 1
-            while j <= boundary_end and j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
-                j += 1
-            if j-1 >= start_i+1:
-                delete_range(doc, start_i+1, j-1)
-            # insert
-            comp = company_order[i] if i < len(company_order) else f"Company_{i+1}"
+            # delete ALL content after the header, up to boundary_end
+            if BULLETS_STRICT_REPLACE and boundary_end >= start_i + 1:
+                delete_range(doc, start_i + 1, boundary_end)
+            elif not BULLETS_STRICT_REPLACE:
+                # soft mode: clear only contiguous bullet-like lines
+                j = start_i + 1
+                while j <= boundary_end and j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
+                    j += 1
+                if j-1 >= start_i+1:
+                    delete_range(doc, start_i+1, j-1)
+            # insert new bullets right below header
             anchor = doc.paragraphs[start_i]
             last = anchor
             for b in bullets_by_company.get(comp, []):
                 last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
     else:
-        app.logger.warning("No headers detected; bullets not injected.")
+        app.logger.warning("No anchors detected; bullets not injected.")
 
     # Return file
     out = io.BytesIO(); doc.save(out); out.seek(0)
