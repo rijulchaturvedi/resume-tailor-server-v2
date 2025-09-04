@@ -30,7 +30,7 @@ def _env_bool(name: str, default: bool=False) -> bool:
     if v is None: return default
     return v.strip().lower() in ("1","true","yes","y","on")
 
-# Default strict replace = ON so old bullets are actually removed unless explicitly disabled.
+# Default strict replace = ON (so original bullets are actually removed).
 SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
 BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
 
@@ -102,6 +102,7 @@ def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional
         try:
             new_para.style = style
         except KeyError:
+            # fallback bullet glyph if the style isn't present
             if run and style.lower().startswith("list") and not run.text.strip().startswith("•"):
                 run.text = f"• {run.text}"
     return new_para
@@ -178,63 +179,41 @@ def company_aliases(company: str) -> List[str]:
 MONTHS = r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December"
 ROLE_LINE_RE = re.compile(rf"\b({MONTHS})\b\s+\d{{4}}\s*-\s*(Present|\b({MONTHS})\b\s+\d{{4}})", re.IGNORECASE)
 
-def scan_role_headers(doc: Document, exp_start: int, exp_end: int) -> List[Tuple[int, str, str]]:
-    headers = []
+def scan_role_headers(doc: Document, exp_start: int, exp_end: int) -> List[int]:
+    """Return indices of lines that look like role headers (have date ranges)."""
+    idxs = []
     for i in range(exp_start+1, exp_end+1):
         t = sanitize(doc.paragraphs[i].text)
-        if not t: continue
-        if ROLE_LINE_RE.search(t):
-            segs = [s.strip() for s in t.split(",")]
-            company_guess = segs[1] if len(segs) >= 2 else ""
-            headers.append((i, t, company_guess))
-    return headers
+        if t and ROLE_LINE_RE.search(t):
+            idxs.append(i)
+    return idxs
 
-def map_experience_to_positions(experience: List[Dict], headers: List[Tuple[int,str,str]]) -> List[Tuple[str,int]]:
-    used = set()
-    positions: List[Tuple[str,int]] = []
-    for e in experience:
-        comp = sanitize(e.get("company",""))
-        role = sanitize(e.get("role",""))
-        aliases = company_aliases(comp)
-        best = None; best_score = -1
-        for (idx, line, company_guess) in headers:
-            if idx in used: continue
-            lc = sanitize(line).lower()
-            score = 0
-            if any(a and a in lc for a in aliases): score += 2
-            rtoks = set(norm_tokens(role))
-            ltoks = set(norm_tokens(line))
-            if rtoks and (len(rtoks & ltoks) > 0): score += 1
-            cg = " ".join(norm_tokens(company_guess))
-            if cg and any(a and a in cg for a in aliases): score += 1
-            if score > best_score:
-                best_score = score; best = idx
-        if best is not None:
-            used.add(best); positions.append((comp, best))
-        else:
-            app.logger.info("No header match for '%s' / role '%s'", comp, role)
-    positions.sort(key=lambda x: x[1])
-    return positions
-
-def next_heading_between(doc: Document, a: int, b: int) -> Optional[int]:
-    for j in range(max(a,0), min(b, len(doc.paragraphs)) + 1):
-        if is_heading(doc.paragraphs[j].text):
-            return j
-    return None
-
-def find_role_anchor_by_text(doc: Document, exp_start: int, exp_end: int, company: str, role: str) -> Optional[int]:
-    aliases = company_aliases(company)
-    role_toks = set(norm_tokens(role))
-    best_idx, best_hits = None, -1
+def find_role_anchor_best(doc: Document, exp_start: int, exp_end: int, company: str, role: str) -> Optional[int]:
+    """Robust anchor: prefer lines that mention company+role tokens; bonus if they look like headers."""
+    ctoks = set(norm_tokens(company))
+    rtoks = set(norm_tokens(role))
+    best_idx, best_score = None, -1
     for i in range(exp_start+1, exp_end+1):
-        line = sanitize(doc.paragraphs[i].text).lower()
+        line = sanitize(doc.paragraphs[i].text)
         if not line: continue
-        if any(a and a in line for a in aliases):
-            hits = len(role_toks & set(norm_tokens(line)))
-            if hits > best_hits:
-                best_hits = hits
-                best_idx = i
+        ltoks = set(norm_tokens(line))
+        score = len(ctoks & ltoks) * 2 + len(rtoks & ltoks)
+        if ROLE_LINE_RE.search(line): score += 1
+        if score > best_score:
+            best_score, best_idx = score, i
     return best_idx
+
+def find_block_end(doc: Document, start_i: int, next_known_start: Optional[int], exp_end: int) -> int:
+    """End of this role block: stop at next role header / next heading / boundary."""
+    limit = (next_known_start - 1) if next_known_start is not None else exp_end
+    for j in range(start_i + 1, min(limit, len(doc.paragraphs) - 1) + 1):
+        t = sanitize(doc.paragraphs[j].text)
+        if not t: 
+            # allow blank lines to be part of block; don't break here
+            continue
+        if ROLE_LINE_RE.search(t) or is_heading(t):
+            return j - 1
+    return limit
 
 # ----------------------------
 # Metrics (resume + JD)
@@ -472,23 +451,21 @@ JSON schema example:
     return out
 
 def inject_bullets_strict(doc: Document,
-                          positions: List[Tuple[str,int]],
+                          anchors: List[Tuple[str,int]],
                           bullets_by_company: Dict[str, List[str]],
                           exp_start: int,
                           exp_end: int):
     """
     Strict replace:
-      - process bottom-up,
-      - delete everything after each role line up to the next role line or next heading,
-      - insert new bullets immediately AFTER the matched role line.
+      - bottom-up,
+      - delete EVERYTHING after header line up to start of next role/heading,
+      - insert new bullets immediately below header.
     """
-    if not positions: return
-
-    for idx in range(len(positions)-1, -1, -1):
-        comp, line_i = positions[idx]
-        next_line = positions[idx+1][1] if idx+1 < len(positions) else exp_end+1
-        h = next_heading_between(doc, line_i+1, next_line-1)
-        boundary_end = (h-1) if h is not None else (next_line-1)
+    if not anchors: return
+    for idx in range(len(anchors)-1, -1, -1):
+        comp, line_i = anchors[idx]
+        next_start = anchors[idx+1][1] if idx+1 < len(anchors) else None
+        boundary_end = find_block_end(doc, line_i, next_start, exp_end)
 
         if boundary_end >= line_i + 1:
             delete_range(doc, line_i + 1, boundary_end)
@@ -530,7 +507,7 @@ def tailor():
             return make_response(("invalid json", 400))
         base_resume_file = None
 
-    # Refresh toggles per request (default strict replace = True)
+    # Toggles (default strict replace = True)
     global SHOW_KPI_PLACEHOLDER, BULLETS_STRICT_REPLACE
     SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
     BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
@@ -564,7 +541,7 @@ def tailor():
     )
     summary = sanitize(gpt(summary_prompt))
 
-    # Experience bounds (accept variants)
+    # Experience section bounds
     exp_sec = (find_section_bounds(base_doc, ["PROFESSIONAL EXPERIENCE"])
                or find_section_bounds(base_doc, ["WORK EXPERIENCE"])
                or find_section_bounds(base_doc, ["EXPERIENCE"]))
@@ -573,39 +550,33 @@ def tailor():
     else:
         exp_start, exp_end = exp_sec
 
-    # Detect role headers and map to your experience entries
-    headers = scan_role_headers(base_doc, exp_start, exp_end)
-    positions = map_experience_to_positions(experience, headers)
+    # Build anchors directly from each experience (robust to header variants)
+    anchors: List[Tuple[str,int]] = []
+    used = set()
+    for e in experience:
+        comp = sanitize(e.get("company",""))
+        role = sanitize(e.get("role",""))
+        idx = find_role_anchor_best(base_doc, exp_start, exp_end, comp, role)
+        if idx is not None and idx not in used:
+            anchors.append((comp, idx))
+            used.add(idx)
+        else:
+            app.logger.warning("No anchor found for %s / %s", comp, role)
 
-    # Fallback 1: anchor by role+company text (no date needed)
-    if experience:
-        claimed = {idx for _, idx in positions}
-        for e in experience:
-            comp = sanitize(e.get("company","")); role = sanitize(e.get("role",""))
-            if any(p[0] == comp for p in positions):
-                continue
-            anchor = find_role_anchor_by_text(base_doc, exp_start, exp_end, comp, role)
-            if anchor is not None and anchor not in claimed:
-                positions.append((comp, anchor)); claimed.add(anchor)
+    # Fallback to detected date-style headers (fill any misses by order)
+    detected = scan_role_headers(base_doc, exp_start, exp_end)
+    free = [i for i in detected if i not in used]
+    missing = [e for e in experience if sanitize(e.get("company","")) not in {c for c,_ in anchors}]
+    for k in range(min(len(missing), len(free))):
+        anchors.append((sanitize(missing[k].get("company","")), free[k]))
+    anchors.sort(key=lambda x: x[1])
+    app.logger.info("Final anchors: %s", anchors)
 
-    # Fallback 2: pair remaining experiences by order to remaining detected headers
-    if headers:
-        used_idxs = {i for _, i in positions}
-        free_headers = [h for h in headers if h[0] not in used_idxs]
-        need = [e for e in experience if sanitize(e.get("company","")) not in {c for c,_ in positions}]
-        fill = min(len(need), len(free_headers))
-        for k in range(fill):
-            comp_name = sanitize(need[k].get("company",""))
-            positions.append((comp_name, free_headers[k][0]))
-    positions.sort(key=lambda x: x[1])
-    app.logger.info("Final mapped positions: %s", positions)
-
-    # Build metrics per mapped role (resume block + JD)
+    # Metrics (resume block + JD), keyed by company
     metrics_by_company: Dict[str, List[str]] = {}
-    for i, (comp, line_i) in enumerate(positions):
-        next_line = positions[i+1][1] if i+1 < len(positions) else exp_end+1
-        h = next_heading_between(base_doc, line_i+1, next_line-1)
-        boundary_end = (h-1) if h is not None else (next_line-1)
+    for i, (comp, line_i) in enumerate(anchors):
+        next_start = anchors[i+1][1] if i+1 < len(anchors) else None
+        boundary_end = find_block_end(base_doc, line_i, next_start, exp_end)
         role_metrics = harvest_metrics_from_block(base_doc, line_i, boundary_end)
         jd_metrics = extract_numeric_phrases(job_desc)
         seen=set()
@@ -618,7 +589,7 @@ def tailor():
     # Generate bullets (single call)
     bullets_by_company = gpt_bullets_batch(experience, job_desc, style_rules, metrics_by_company)
 
-    # Skills map (JD-driven)
+    # Skills (keep originals; append deduped)
     SKILL_BANK = {
         "Business Analysis & Delivery": [
             "Requirements elicitation","User stories","Acceptance criteria","UAT","BPMN","UML",
@@ -654,18 +625,20 @@ def tailor():
             seen=set(); merged=[x for x in hits+items if (x not in seen and not seen.add(x))]
             out[cat] = merged[:top_k]
         return out
+    skills_categories = skills_categories or list(SKILL_BANK.keys())
     skills_map = pick_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories}) if skills_categories else {}
 
-    # Edit DOCX
+    # Apply edits
     doc = base_doc
     write_summary(doc, summary)
     inject_skills(doc, skills_map)
 
-    if positions:
+    if anchors:
         if BULLETS_STRICT_REPLACE:
-            inject_bullets_strict(doc, positions, bullets_by_company, exp_start, exp_end)
+            inject_bullets_strict(doc, anchors, bullets_by_company, exp_start, exp_end)
         else:
-            for comp, line_i in reversed(positions):
+            for comp, line_i in reversed(anchors):
+                # clear contiguous bullets only
                 j = line_i + 1
                 while j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
                     j += 1
@@ -676,8 +649,9 @@ def tailor():
                 for b in bullets_by_company.get(comp, []):
                     last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
     else:
-        app.logger.warning("No role headers detected or mapped; bullets not injected.")
+        app.logger.warning("No anchors detected; bullets not injected.")
 
+    # Return file
     out = io.BytesIO(); doc.save(out); out.seek(0)
     resp = make_response(send_file(
         out,
