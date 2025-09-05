@@ -7,32 +7,29 @@ import io, os, json, re, logging
 from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
-# ----------------------------
-# App & CORS (Chrome extension → /tailor)
-# ----------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/tailor": {"origins": "chrome-extension://*"}})
 app.logger.setLevel(logging.INFO)
 
 # ----------------------------
-# Model / OpenAI settings
+# OpenAI config
 # ----------------------------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # set to "gpt-5" if you wish
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").strip().lower() in ("1", "true", "yes")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").strip().lower() not in ("0", "false", "no")
 OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))
 OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20"))
+USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").strip().lower() in ("1","true","yes")
 
 def _env_bool(name: str, default: bool=False) -> bool:
     v = os.getenv(name)
     if v is None: return default
-    return v.strip().lower() in ("1","true","yes","y","on")
+    return v.strip().lower() in ("1","true","yes","on","y")
 
-# Behavior toggles (overridable via JSON options)
+# Behavior toggles (can be overridden via JSON options)
 SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
-BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)  # strict ON by default
+BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
 
 try:
     from openai import OpenAI
@@ -41,8 +38,18 @@ except Exception:
     _openai_available = False
 
 # ----------------------------
-# Text / headings utils
+# Text helpers
 # ----------------------------
+KNOWN_HEADINGS = {
+    "PROFESSIONAL SUMMARY","SUMMARY",
+    "EXPERIENCE","WORK EXPERIENCE","PROFESSIONAL EXPERIENCE",
+    "SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS",
+    "EDUCATION","PROJECTS","CERTIFICATIONS","PUBLICATIONS","ACHIEVEMENTS"
+}
+
+MONTHS = r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December"
+ROLE_LINE_RE = re.compile(rf"\b({MONTHS})\b\s+\d{{4}}\s*-\s*(Present|\b({MONTHS})\b\s+\d{{4}})", re.IGNORECASE)
+
 def sanitize(text: str) -> str:
     if not text: return ""
     text = text.replace("\u00A0", " ").replace("\t", " ")
@@ -53,7 +60,6 @@ def sanitize(text: str) -> str:
     return text.strip()
 
 def _canon(s: str) -> str:
-    # Lower, strip punctuation -> words
     s = sanitize(s).lower()
     s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -66,15 +72,58 @@ def _norm_heading(text: str) -> str:
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
-KNOWN_HEADINGS = {
-    "PROFESSIONAL SUMMARY","SUMMARY",
-    "EXPERIENCE","WORK EXPERIENCE","PROFESSIONAL EXPERIENCE",
-    "SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS",
-    "EDUCATION","PROJECTS","CERTIFICATIONS","PUBLICATIONS","ACHIEVEMENTS"
-}
-
 def is_major_heading(text: str) -> bool:
-    return _norm_heading(text) in KNOWN_HEADINGS
+    t = _norm_heading(text)
+    return (not t) or t in KNOWN_HEADINGS or t.isupper()
+
+def is_bullet_para(p) -> bool:
+    try:
+        name = (p.style.name or "").lower()
+    except Exception:
+        name = ""
+    if "bullet" in name or "list" in name:
+        return True
+    t = sanitize(p.text)
+    if not t: return False
+    if t.startswith(("•","▪","– ","- ","— ")): return True
+    if re.match(r"^\s*\d+[\.\)]\s+", t): return True
+    return False
+
+# ----------------------------
+# DOCX utils
+# ----------------------------
+def ensure_docx(doc_or_bytes):
+    try:
+        if hasattr(doc_or_bytes, "paragraphs"):
+            return doc_or_bytes
+        if hasattr(doc_or_bytes, "read"):
+            data = doc_or_bytes.read()
+        else:
+            data = doc_or_bytes
+        return Document(io.BytesIO(data))
+    except Exception as e:
+        raise RuntimeError(f"Failed to open DOCX: {e}")
+
+def delete_range(doc: Document, start: int, end: int):
+    for i in range(end, start-1, -1):
+        p = doc.paragraphs[i]._element
+        p.getparent().remove(p)
+
+def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional[str] = None) -> Paragraph:
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    new_para = Paragraph(new_p, paragraph._parent)
+    run = None
+    if text:
+        run = new_para.add_run(text)
+    if style:
+        try:
+            new_para.style = style
+        except KeyError:
+            # fallback bullet glyph if "List Bullet" style isn't present
+            if run and style.lower().startswith("list") and not run.text.strip().startswith("•"):
+                run.text = f"• {run.text}"
+    return new_para
 
 def find_section_bounds(doc: Document, titles: List[str]) -> Optional[Tuple[int,int]]:
     titles_up = {_norm_heading(t) for t in titles}
@@ -110,50 +159,57 @@ def find_all_section_bounds(doc: Document, titles: List[str]) -> List[Tuple[int,
             i += 1
     return spans
 
-def delete_range(doc: Document, start: int, end: int):
-    for i in range(end, start-1, -1):
-        p = doc.paragraphs[i]._element
-        p.getparent().remove(p)
-
-def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional[str] = None) -> Paragraph:
-    new_p = OxmlElement("w:p")
-    paragraph._p.addnext(new_p)
-    new_para = Paragraph(new_p, paragraph._parent)
-    run = None
-    if text:
-        run = new_para.add_run(text)
-    if style:
-        try:
-            new_para.style = style
-        except KeyError:
-            # fallback bullet glyph if List style isn't in the template
-            if run and style.lower().startswith("list") and not run.text.strip().startswith("•"):
-                run.text = f"• {run.text}"
-    return new_para
-
 # ----------------------------
-# DOCX load helper
+# Exact header anchoring (STRICT, order-driven)
 # ----------------------------
-def ensure_docx(doc_or_bytes):
-    try:
-        if hasattr(doc_or_bytes, "paragraphs"):
-            return doc_or_bytes
-        if hasattr(doc_or_bytes, "read"):
-            data = doc_or_bytes.read()
+def exactish_match(line: str, target: str) -> bool:
+    L = _canon(line); T = _canon(target)
+    if not L or not T: return False
+    return L == T or (T in L)
+
+def find_anchors_by_exact_headers(doc: Document, exact_headers: Dict[str,str]) -> List[Tuple[str,int]]:
+    """
+    exact_headers: { company -> full visible header line in the DOCX }
+    Returns anchors sorted by document order: [(company, idx), ...]
+    """
+    pairs = []
+    for comp, header in exact_headers.items():
+        pairs.append((sanitize(comp), header))
+
+    found = []
+    seen_idx = set()
+    for comp, header in pairs:
+        idx = None
+        # pass 1: equality match on sanitized text
+        for i, p in enumerate(doc.paragraphs):
+            if sanitize(p.text) == sanitize(header):
+                idx = i; break
+        # pass 2: exactish (substring on canon)
+        if idx is None:
+            for i, p in enumerate(doc.paragraphs):
+                if exactish_match(p.text, header):
+                    idx = i; break
+        if idx is not None and idx not in seen_idx:
+            found.append((comp, idx))
+            seen_idx.add(idx)
         else:
-            data = doc_or_bytes
-        return Document(io.BytesIO(data))
-    except Exception as e:
-        raise RuntimeError(f"Failed to open DOCX: {e}")
+            app.logger.warning("Exact header NOT found for %s -> '%s'", comp, header)
+
+    found.sort(key=lambda x: x[1])
+    return found
+
+def next_index_after(idx: int, arr: List[int]) -> Optional[int]:
+    for a in arr:
+        if a > idx: return a
+    return None
 
 # ----------------------------
-# Quantification helpers
+# KPI placeholder / quantification
 # ----------------------------
 QUANT_REGEX = re.compile(
     r"(\d|\$|%|\bhrs?\b|\bhour(s)?\b|\bday(s)?\b|\bweek(s)?\b|\bmonth(s)?\b|\byear(s)?\b|\b\d{1,3}k\b)",
     re.IGNORECASE
 )
-
 def ensure_quantified(bullets: List[str], placeholder: str = "quantified impact: KPI TBD") -> List[str]:
     if not SHOW_KPI_PLACEHOLDER:
         return [sanitize(b) for b in bullets]
@@ -163,135 +219,8 @@ def ensure_quantified(bullets: List[str], placeholder: str = "quantified impact:
         out.append(t if QUANT_REGEX.search(t) else f"{t} ({placeholder})")
     return out
 
-def is_bullet_para(p) -> bool:
-    try:
-        name = (p.style.name or "").lower()
-    except Exception:
-        name = ""
-    if "bullet" in name or "list" in name:
-        return True
-    t = sanitize(p.text)
-    if not t: return False
-    if t.startswith(("•","▪","– ","- ","— ")): return True
-    if re.match(r"^\s*\d+[\.\)]\s+", t): return True
-    return False
-
 # ----------------------------
-# Role/header detection
-# ----------------------------
-MONTHS = r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December"
-ROLE_LINE_RE = re.compile(rf"\b({MONTHS})\b\s+\d{{4}}\s*-\s*(Present|\b({MONTHS})\b\s+\d{{4}})", re.IGNORECASE)
-
-def looks_like_role_header(line: str) -> bool:
-    t = sanitize(line)
-    if not t: return False
-    if ROLE_LINE_RE.search(t): return True
-    return "," in t  # role, company, location pattern
-
-def token_set(s: str) -> set:
-    return set(_canon(s).split())
-
-def contains_all(hay: set, need: set) -> bool:
-    return bool(need) and need.issubset(hay)
-
-def match_exactish(line: str, target: str) -> bool:
-    L = _canon(line)
-    T = _canon(target)
-    if not L or not T: return False
-    if L == T: return True
-    if T in L: return True
-    tset, lset = set(T.split()), set(L.split())
-    return bool(tset) and tset.issubset(lset)
-
-def find_role_anchor(doc: Document, role: str, company: str, header_hint: Optional[str]) -> Optional[int]:
-    """
-    Prefer: a paragraph with a date range AND both role+company tokens.
-    Next: header_hint exactish match.
-    Fallback: paragraph with role+company tokens and bullets immediately after.
-    """
-    role_t = token_set(role)
-    comp_t = token_set(company)
-
-    # Pass 1: date range + tokens
-    best_idx = None
-    for i, p in enumerate(doc.paragraphs):
-        line = sanitize(p.text)
-        if not line: continue
-        if not ROLE_LINE_RE.search(line):  # must have date range
-            continue
-        if not looks_like_role_header(line):
-            continue
-        bag = token_set(line)
-        if contains_all(bag, role_t) and contains_all(bag, comp_t):
-            best_idx = i
-            break
-    if best_idx is not None:
-        return best_idx
-
-    # Pass 2: header hint (exactish) if provided
-    if header_hint:
-        for i, p in enumerate(doc.paragraphs):
-            if match_exactish(p.text, header_hint):
-                return i
-
-    # Pass 3: tokens + bullets following
-    for i, p in enumerate(doc.paragraphs):
-        line = sanitize(p.text)
-        if not line: continue
-        if not looks_like_role_header(line):
-            continue
-        bag = token_set(line)
-        if contains_all(bag, role_t) and contains_all(bag, comp_t):
-            # bullets next 1–2 lines?
-            nxt1 = doc.paragraphs[i+1] if i+1 < len(doc.paragraphs) else None
-            nxt2 = doc.paragraphs[i+2] if i+2 < len(doc.paragraphs) else None
-            if (nxt1 and is_bullet_para(nxt1)) or (nxt2 and is_bullet_para(nxt2)):
-                return i
-    return None
-
-def all_role_header_indices(doc: Document) -> List[int]:
-    """All lines that clearly look like role headers by date range."""
-    out = []
-    for i, p in enumerate(doc.paragraphs):
-        if ROLE_LINE_RE.search(sanitize(p.text)):
-            out.append(i)
-    return out
-
-def all_major_heading_indices(doc: Document) -> List[int]:
-    idxs = []
-    for i, p in enumerate(doc.paragraphs):
-        if is_major_heading(p.text):
-            idxs.append(i)
-    return idxs
-
-# ----------------------------
-# Metrics (resume + JD)
-# ----------------------------
-NUM_PHRASE_REGEX = re.compile(
-    r"(\$?\d+(?:\.\d+)?\s?(?:k|m|bn|b|million|billion)?|\d+\s?(?:%|percent)|\d+\+\b|"
-    r"\b\d+\s?(?:days?|weeks?|months?|years?)|\$\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d{1,3}%|\d{1,3}\s?%)",
-    re.IGNORECASE
-)
-
-def extract_numeric_phrases(text: str, max_phrases: int = 12) -> List[str]:
-    found = []
-    for m in NUM_PHRASE_REGEX.finditer(text or ""):
-        val = sanitize(m.group(0))
-        if val and val not in found:
-            found.append(val)
-        if len(found) >= max_phrases: break
-    return found
-
-def harvest_metrics_from_block(doc: Document, start_idx: int, boundary_end: int) -> List[str]:
-    buf = []
-    for i in range(start_idx + 1, min(boundary_end + 1, len(doc.paragraphs))):
-        t = sanitize(doc.paragraphs[i].text)
-        if not t or is_major_heading(t): break
-        buf.append(t)
-    return extract_numeric_phrases("  ".join(buf))
-
-# ----------------------------
-# OpenAI helpers
+# OpenAI
 # ----------------------------
 def _get_client():
     if not OPENAI_API_KEY or not _openai_available or not OAI_ENABLED:
@@ -344,7 +273,7 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
         return "Placeholder output due to model error."
 
 # ----------------------------
-# Summary & Skills writers (keep originals; append deduped)
+# Summary & Skills (append new skills; keep originals)
 # ----------------------------
 def write_summary(doc: Document, summary: str):
     sec = find_section_bounds(doc, ["PROFESSIONAL SUMMARY","SUMMARY"])
@@ -434,7 +363,7 @@ def inject_skills(doc: Document, new_skills: Dict[str, list]):
     rewrite_skills_section(doc, first_s, last_e, order, mapping)
 
 # ----------------------------
-# GPT bullets (batch)
+# GPT bullets (batch generation)
 # ----------------------------
 def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str], metrics_by_company: Dict[str, List[str]]) -> Dict[str, List[str]]:
     entries = []
@@ -492,15 +421,6 @@ JSON schema example:
     return out
 
 # ----------------------------
-# Intro bullets purge (between Experience heading and first role)
-# ----------------------------
-def purge_intro_bullets(doc: Document, exp_start: int, first_anchor_idx: int):
-    s = exp_start + 1
-    e = max(first_anchor_idx - 1, s - 1)
-    if s <= e:
-        delete_range(doc, s, e)
-
-# ----------------------------
 # Routes
 # ----------------------------
 @app.route("/")
@@ -516,7 +436,7 @@ def health():
 def tailor():
     origin = request.headers.get("Origin", "*")
 
-    # JSON or multipart
+    # parse JSON or multipart
     if request.content_type and "multipart/form-data" in request.content_type.lower():
         base_resume_file = request.files.get("base_resume")
         payload_part = request.form.get("payload")
@@ -532,30 +452,29 @@ def tailor():
             return make_response(("invalid json", 400))
         base_resume_file = None
 
-    # Toggles
+    # toggles
     global SHOW_KPI_PLACEHOLDER, BULLETS_STRICT_REPLACE
     SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
     BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
     opts = (data.get("options") or {})
     if "show_kpi_placeholder" in opts: SHOW_KPI_PLACEHOLDER = bool(opts["show_kpi_placeholder"])
     if "strict_replace" in opts: BULLETS_STRICT_REPLACE = bool(opts["strict_replace"])
-    app.logger.info("Toggles -> strict_replace=%s, show_kpi_placeholder=%s",
-                    BULLETS_STRICT_REPLACE, SHOW_KPI_PLACEHOLDER)
+    app.logger.info("Toggles -> strict_replace=%s, show_kpi_placeholder=%s", BULLETS_STRICT_REPLACE, SHOW_KPI_PLACEHOLDER)
 
-    # Exact headers map (keys = company, values = visible header line in DOCX)
-    exact_headers: Dict[str, str] = {}
+    # exact headers mapping is REQUIRED for precise replace
+    exact_headers: Dict[str,str] = {}
     if "exact_headers" in opts and isinstance(opts["exact_headers"], dict):
-        exact_headers = { sanitize(k): v for k,v in opts["exact_headers"].items() if v }
+        exact_headers = { sanitize(k): v for k, v in opts["exact_headers"].items() if v }
 
-    # Inputs
-    job_desc = sanitize((data or {}).get("job_description",""))
-    cfg = (data or {}).get("resume_config",{}) or {}
+    # inputs
+    job_desc = sanitize(data.get("job_description",""))
+    cfg = (data.get("resume_config") or {}) or {}
     summary_sentences = int(cfg.get("summary_sentences", 2))
     experience = cfg.get("experience",[]) or []
     skills_categories = cfg.get("skills_categories",[]) or []
     style_rules = (opts.get("style_rules") or [])
 
-    # Load base resume
+    # base resume
     if base_resume_file:
         base_doc = ensure_docx(base_resume_file)
     else:
@@ -565,82 +484,70 @@ def tailor():
         with open(base_path, "rb") as f:
             base_doc = ensure_docx(f)
 
-    # Summary
+    # summary
     summary_prompt = (
         f"Write {summary_sentences} sentence professional summary aligned to the job description below. "
         f"Use concise, specific language; prefer quantified outcomes; avoid buzzwords and dashes.\n---\n{job_desc[:1500]}"
     )
     summary = sanitize(gpt(summary_prompt))
 
-    # Experience section bounds (for intro purge)
-    exp_sec = (find_section_bounds(base_doc, ["PROFESSIONAL EXPERIENCE"])
-               or find_section_bounds(base_doc, ["WORK EXPERIENCE"])
-               or find_section_bounds(base_doc, ["EXPERIENCE"]))
-    exp_start = exp_sec[0] if exp_sec else 0
+    # anchors from exact headers (strict)
+    anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
+    app.logger.info("Anchors (exact headers): %s", anchors)
 
+    # boundary calculation: next anchor OR next major heading
     full_end = len(base_doc.paragraphs) - 1
-
-    # ---- Anchor detection
-    anchors: List[Tuple[str,int]] = []
-    used = set()
-    for e in experience:
-        k = int(e.get("bullets", 0) or 0)
-        if k <= 0: 
-            continue
-        comp = sanitize(e.get("company",""))
-        role = sanitize(e.get("role",""))
-        hint = (exact_headers.get(comp) if exact_headers else None)
-        idx = find_role_anchor(base_doc, role, comp, hint)
-        if idx is None:
-            app.logger.warning("Role header not found for %s / %s", comp, role)
-            continue
-        if idx not in used:
-            anchors.append((comp, idx)); used.add(idx)
-
-    anchors.sort(key=lambda x: x[1])
-    app.logger.info("Final anchors: %s", anchors)
-
-    # Purge intro bullets (between Experience heading and first job)
-    if anchors and exp_start < anchors[0][1]:
-        purge_intro_bullets(base_doc, exp_start, anchors[0][1])
-
-    # Precompute boundaries: next real role header + next major heading
-    role_header_idxs = all_role_header_indices(base_doc)
-    major_heading_idxs = all_major_heading_indices(base_doc)
-
-    def next_index_after(idx: int, arr: List[int]) -> Optional[int]:
-        for a in arr:
-            if a > idx: return a
-        return None
-
+    major_heading_idxs = [i for i,p in enumerate(base_doc.paragraphs) if is_major_heading(p.text)]
     boundaries: Dict[int,int] = {}
-    for _, start_i in anchors:
-        next_role = next_index_after(start_i, role_header_idxs)
+    anchor_indices_sorted = [idx for _, idx in anchors]
+
+    for i, (_, start_i) in enumerate(anchors):
+        next_anchor = anchor_indices_sorted[i+1] if i+1 < len(anchor_indices_sorted) else None
         next_heading = next_index_after(start_i, major_heading_idxs)
         candidates = []
-        if next_role is not None: candidates.append(next_role - 1)
+        if next_anchor is not None: candidates.append(next_anchor - 1)
         if next_heading is not None: candidates.append(next_heading - 1)
         boundary_end = min(candidates) if candidates else full_end
         boundaries[start_i] = max(start_i, min(boundary_end, full_end))
 
-    # Metrics (resume block + JD), keyed by company
+    # metrics (resume text between header..boundary + JD numbers)
+    NUM_PHRASE_REGEX = re.compile(
+        r"(\$?\d+(?:\.\d+)?\s?(?:k|m|bn|b|million|billion)?|\d+\s?(?:%|percent)|\d+\+\b|"
+        r"\b\d+\s?(?:days?|weeks?|months?|years?)|\$\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d{1,3}%|\d{1,3}\s?%)",
+        re.IGNORECASE
+    )
+    def extract_numeric_phrases(text: str, max_phrases: int = 12) -> List[str]:
+        found = []
+        for m in NUM_PHRASE_REGEX.finditer(text or ""):
+            val = sanitize(m.group(0))
+            if val and val not in found:
+                found.append(val)
+            if len(found) >= max_phrases: break
+        return found
+
+    def harvest_metrics(doc: Document, start_idx: int, end_idx: int) -> List[str]:
+        buf = []
+        for i in range(start_idx + 1, min(end_idx + 1, len(doc.paragraphs))):
+            t = sanitize(doc.paragraphs[i].text)
+            if not t or is_major_heading(t): break
+            buf.append(t)
+        return extract_numeric_phrases("  ".join(buf))
+
     metrics_by_company: Dict[str, List[str]] = {}
     for comp, start_i in anchors:
-        boundary_end = boundaries[start_i]
-        role_metrics = harvest_metrics_from_block(base_doc, start_i, boundary_end)
+        end_i = boundaries[start_i]
+        role_metrics = harvest_metrics(base_doc, start_i, end_i)
         jd_metrics = extract_numeric_phrases(job_desc)
-        seen=set()
-        merged=[x for x in role_metrics + jd_metrics if (x not in seen and not seen.add(x))][:20]
-        metrics_by_company[comp] = merged
-    for e in experience:
-        comp = sanitize(e.get("company",""))
-        if comp not in metrics_by_company:
-            metrics_by_company[comp] = extract_numeric_phrases(job_desc)
+        merged, seen = [], set()
+        for val in role_metrics + jd_metrics:
+            if val not in seen:
+                seen.add(val); merged.append(val)
+        metrics_by_company[comp] = merged[:20]
 
-    # Generate bullets (single batch call)
+    # bullets (one call)
     bullets_by_company = gpt_bullets_batch(experience, job_desc, style_rules, metrics_by_company)
 
-    # Skills (keep originals; append deduped)
+    # skills: keep originals; append deduped
     SKILL_BANK = {
         "Business Analysis & Delivery": [
             "Requirements elicitation","User stories","Acceptance criteria","UAT","BPMN","UML",
@@ -676,42 +583,43 @@ def tailor():
             seen=set(); merged=[x for x in hits+items if (x not in seen and not seen.add(x))]
             out[cat] = merged[:top_k]
         return out
+
     skills_categories = skills_categories or list(SKILL_BANK.keys())
     skills_map = pick_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories}) if skills_categories else {}
 
-    # Apply summary & skills
+    # apply summary & skills
     doc = base_doc
     write_summary(doc, summary)
     inject_skills(doc, skills_map)
 
-    # Strict bullet replacement under each role header
+    # ---- STRICT REPLACE per exact header (bottom-up)
     if anchors:
-        # Bottom-up to keep indices stable
         for idx in range(len(anchors)-1, -1, -1):
             comp, start_i = anchors[idx]
-            boundary_end = boundaries[start_i]
+            end_i = boundaries[start_i]
 
-            # 1) Delete everything after header to boundary
-            if BULLETS_STRICT_REPLACE and boundary_end >= start_i + 1:
-                delete_range(doc, start_i + 1, boundary_end)
+            # delete everything after header down to boundary
+            if BULLETS_STRICT_REPLACE and end_i >= start_i + 1:
+                delete_range(doc, start_i + 1, end_i)
             elif not BULLETS_STRICT_REPLACE:
+                # delete only existing bullets just under header
                 j = start_i + 1
-                while j <= boundary_end and j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
+                while j <= end_i and j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
                     j += 1
                 if j-1 >= start_i+1:
                     delete_range(doc, start_i+1, j-1)
 
-            # 2) Re-resolve anchor (avoid stale reference after deletions)
+            # re-resolve header (indices may have shifted after deletion)
             anchor_para = doc.paragraphs[start_i]
 
-            # 3) Insert new bullets *immediately below* the header
+            # insert bullets immediately below header
             last = anchor_para
             for b in bullets_by_company.get(comp, []):
                 last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
     else:
-        app.logger.warning("No anchors detected; bullets not injected.")
+        app.logger.warning("No anchors detected from exact_headers; bullets not injected.")
 
-    # Return file
+    # send file
     out = io.BytesIO(); doc.save(out); out.seek(0)
     resp = make_response(send_file(
         out,
@@ -723,9 +631,6 @@ def tailor():
     resp.headers["Vary"] = "Origin"
     return resp
 
-# ---------------
-# Local dev
-# ---------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","8000"))
     app.run(host="0.0.0.0", port=port)
