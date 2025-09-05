@@ -7,6 +7,9 @@ import io, os, json, re, logging
 from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
+# ----------------------------
+# App & CORS (Chrome extension → /tailor)
+# ----------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/tailor": {"origins": "chrome-extension://*"}})
 app.logger.setLevel(logging.INFO)
@@ -14,7 +17,7 @@ app.logger.setLevel(logging.INFO)
 # ----------------------------
 # OpenAI config
 # ----------------------------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # set to "gpt-5" if desired
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").strip().lower() not in ("0", "false", "no")
@@ -27,7 +30,7 @@ def _env_bool(name: str, default: bool=False) -> bool:
     if v is None: return default
     return v.strip().lower() in ("1","true","yes","on","y")
 
-# Behavior toggles (can be overridden via JSON options)
+# Behavior toggles (overridable via JSON options)
 SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
 BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
 
@@ -180,7 +183,7 @@ def find_anchors_by_exact_headers(doc: Document, exact_headers: Dict[str,str]) -
     seen_idx = set()
     for comp, header in pairs:
         idx = None
-        # pass 1: equality match on sanitized text
+        # pass 1: equality match
         for i, p in enumerate(doc.paragraphs):
             if sanitize(p.text) == sanitize(header):
                 idx = i; break
@@ -459,9 +462,10 @@ def tailor():
     opts = (data.get("options") or {})
     if "show_kpi_placeholder" in opts: SHOW_KPI_PLACEHOLDER = bool(opts["show_kpi_placeholder"])
     if "strict_replace" in opts: BULLETS_STRICT_REPLACE = bool(opts["strict_replace"])
-    app.logger.info("Toggles -> strict_replace=%s, show_kpi_placeholder=%s", BULLETS_STRICT_REPLACE, SHOW_KPI_PLACEHOLDER)
+    app.logger.info("Toggles -> strict_replace=%s, show_kpi_placeholder=%s",
+                    BULLETS_STRICT_REPLACE, SHOW_KPI_PLACEHOLDER)
 
-    # exact headers mapping is REQUIRED for precise replace
+    # exact headers (company -> exact visible header line)
     exact_headers: Dict[str,str] = {}
     if "exact_headers" in opts and isinstance(opts["exact_headers"], dict):
         exact_headers = { sanitize(k): v for k, v in opts["exact_headers"].items() if v }
@@ -491,11 +495,11 @@ def tailor():
     )
     summary = sanitize(gpt(summary_prompt))
 
-    # anchors from exact headers (strict)
+    # anchors from exact headers (strict identification)
     anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
     app.logger.info("Anchors (exact headers): %s", anchors)
 
-    # boundary calculation: next anchor OR next major heading
+    # boundary calculation: next exact header OR next major heading
     full_end = len(base_doc.paragraphs) - 1
     major_heading_idxs = [i for i,p in enumerate(base_doc.paragraphs) if is_major_heading(p.text)]
     boundaries: Dict[int,int] = {}
@@ -592,28 +596,23 @@ def tailor():
     write_summary(doc, summary)
     inject_skills(doc, skills_map)
 
-    # ---- STRICT REPLACE per exact header (bottom-up)
+    # ---- STRICT REPLACE / APPEND per role header (bottom-up to keep indices stable)
     if anchors:
         for idx in range(len(anchors)-1, -1, -1):
             comp, start_i = anchors[idx]
-            end_i = boundaries[start_i]
+            boundary_end = boundaries[start_i]
 
-            # delete everything after header down to boundary
-            if BULLETS_STRICT_REPLACE and end_i >= start_i + 1:
-                delete_range(doc, start_i + 1, end_i)
-            elif not BULLETS_STRICT_REPLACE:
-                # delete only existing bullets just under header
-                j = start_i + 1
-                while j <= end_i and j < len(doc.paragraphs) and is_bullet_para(doc.paragraphs[j]):
-                    j += 1
-                if j-1 >= start_i+1:
-                    delete_range(doc, start_i+1, j-1)
+            if BULLETS_STRICT_REPLACE:
+                # Replace: delete everything under the header up to boundary
+                if boundary_end >= start_i + 1:
+                    delete_range(doc, start_i + 1, boundary_end)
+                insert_base = doc.paragraphs[start_i]  # insert directly below header
+            else:
+                # Append: keep originals; insert after the section’s last paragraph
+                insert_base = doc.paragraphs[boundary_end] if boundary_end >= start_i else doc.paragraphs[start_i]
 
-            # re-resolve header (indices may have shifted after deletion)
-            anchor_para = doc.paragraphs[start_i]
-
-            # insert bullets immediately below header
-            last = anchor_para
+            # Insert bullets immediately after chosen base
+            last = insert_base
             for b in bullets_by_company.get(comp, []):
                 last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
     else:
