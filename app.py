@@ -603,13 +603,29 @@ def tailor():
             boundary_end = boundaries[start_i]
 
             if BULLETS_STRICT_REPLACE:
-                # Replace: delete everything under the header up to boundary
+                # Replace: delete everything under the header up to boundary, then insert below header
                 if boundary_end >= start_i + 1:
                     delete_range(doc, start_i + 1, boundary_end)
-                insert_base = doc.paragraphs[start_i]  # insert directly below header
+                insert_base = doc.paragraphs[start_i]
             else:
-                # Append: keep originals; insert after the section’s last paragraph
-                insert_base = doc.paragraphs[boundary_end] if boundary_end >= start_i else doc.paragraphs[start_i]
+                # Append within section: place bullets AFTER any existing bullets just under this header;
+                # if none exist, place immediately under the header.
+                insert_base = doc.paragraphs[start_i]
+                j = start_i + 1
+                last_bullet_idx = None
+                while j <= boundary_end and j < len(doc.paragraphs):
+                    if is_major_heading(doc.paragraphs[j].text):
+                        break
+                    if is_bullet_para(doc.paragraphs[j]):
+                        last_bullet_idx = j
+                    else:
+                        # stop scanning once bullets stop (we only want bullets directly under the header)
+                        if last_bullet_idx is not None:
+                            break
+                    j += 1
+                if last_bullet_idx is not None:
+                    insert_base = doc.paragraphs[last_bullet_idx]
+                # else keep insert_base as the header paragraph
 
             # Insert bullets immediately after chosen base
             last = insert_base
