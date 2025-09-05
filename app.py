@@ -8,7 +8,7 @@ from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 # ----------------------------
-# App & CORS (Chrome extension → /tailor)
+# App & CORS
 # ----------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/tailor": {"origins": "chrome-extension://*"}})
@@ -17,7 +17,7 @@ app.logger.setLevel(logging.INFO)
 # ----------------------------
 # OpenAI config
 # ----------------------------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # set to "gpt-5" if desired
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # or "gpt-5" if you prefer
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").strip().lower() not in ("0", "false", "no")
@@ -50,9 +50,6 @@ KNOWN_HEADINGS = {
     "EDUCATION","PROJECTS","CERTIFICATIONS","PUBLICATIONS","ACHIEVEMENTS"
 }
 
-MONTHS = r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December"
-ROLE_LINE_RE = re.compile(rf"\b({MONTHS})\b\s+\d{{4}}\s*-\s*(Present|\b({MONTHS})\b\s+\d{{4}})", re.IGNORECASE)
-
 def sanitize(text: str) -> str:
     if not text: return ""
     text = text.replace("\u00A0", " ").replace("\t", " ")
@@ -78,19 +75,6 @@ def _norm_heading(text: str) -> str:
 def is_major_heading(text: str) -> bool:
     t = _norm_heading(text)
     return (not t) or t in KNOWN_HEADINGS or t.isupper()
-
-def is_bullet_para(p) -> bool:
-    try:
-        name = (p.style.name or "").lower()
-    except Exception:
-        name = ""
-    if "bullet" in name or "list" in name:
-        return True
-    t = sanitize(p.text)
-    if not t: return False
-    if t.startswith(("•","▪","– ","- ","— ")): return True
-    if re.match(r"^\s*\d+[\.\)]\s+", t): return True
-    return False
 
 # ----------------------------
 # DOCX utils
@@ -162,42 +146,31 @@ def find_all_section_bounds(doc: Document, titles: List[str]) -> List[Tuple[int,
             i += 1
     return spans
 
-# ----------------------------
-# Exact header anchoring (STRICT, order-driven)
-# ----------------------------
 def exactish_match(line: str, target: str) -> bool:
     L = _canon(line); T = _canon(target)
     if not L or not T: return False
     return L == T or (T in L)
 
 def find_anchors_by_exact_headers(doc: Document, exact_headers: Dict[str,str]) -> List[Tuple[str,int]]:
-    """
-    exact_headers: { company -> full visible header line in the DOCX }
-    Returns anchors sorted by document order: [(company, idx), ...]
-    """
-    pairs = []
-    for comp, header in exact_headers.items():
-        pairs.append((sanitize(comp), header))
-
+    """ exact_headers: { company -> exact visible header line in the DOCX } """
+    pairs = [(sanitize(k), v) for k, v in exact_headers.items()]
     found = []
-    seen_idx = set()
+    used = set()
     for comp, header in pairs:
         idx = None
-        # pass 1: equality match
+        # strict equality on sanitized text
         for i, p in enumerate(doc.paragraphs):
             if sanitize(p.text) == sanitize(header):
                 idx = i; break
-        # pass 2: exactish (substring on canon)
+        # fallback: canon contains
         if idx is None:
             for i, p in enumerate(doc.paragraphs):
                 if exactish_match(p.text, header):
                     idx = i; break
-        if idx is not None and idx not in seen_idx:
-            found.append((comp, idx))
-            seen_idx.add(idx)
+        if idx is not None and idx not in used:
+            found.append((comp, idx)); used.add(idx)
         else:
             app.logger.warning("Exact header NOT found for %s -> '%s'", comp, header)
-
     found.sort(key=lambda x: x[1])
     return found
 
@@ -276,7 +249,7 @@ def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> st
         return "Placeholder output due to model error."
 
 # ----------------------------
-# Summary & Skills (append new skills; keep originals)
+# Summary & Skills (keep originals; append new)
 # ----------------------------
 def write_summary(doc: Document, summary: str):
     sec = find_section_bounds(doc, ["PROFESSIONAL SUMMARY","SUMMARY"])
@@ -455,7 +428,7 @@ def tailor():
             return make_response(("invalid json", 400))
         base_resume_file = None
 
-    # toggles
+    # toggles (can be overridden by options)
     global SHOW_KPI_PLACEHOLDER, BULLETS_STRICT_REPLACE
     SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
     BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
@@ -488,33 +461,23 @@ def tailor():
         with open(base_path, "rb") as f:
             base_doc = ensure_docx(f)
 
-    # summary
-    summary_prompt = (
-        f"Write {summary_sentences} sentence professional summary aligned to the job description below. "
-        f"Use concise, specific language; prefer quantified outcomes; avoid buzzwords and dashes.\n---\n{job_desc[:1500]}"
-    )
-    summary = sanitize(gpt(summary_prompt))
+    # ---------- pass 1: locate anchors to harvest metrics (pre-edit)
+    anchors_pre = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
+    full_end_pre = len(base_doc.paragraphs) - 1
+    major_heading_idxs_pre = [i for i,p in enumerate(base_doc.paragraphs) if is_major_heading(p.text)]
+    boundaries_pre: Dict[int,int] = {}
+    anchor_indices_sorted_pre = [idx for _, idx in anchors_pre]
 
-    # anchors from exact headers (strict identification)
-    anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
-    app.logger.info("Anchors (exact headers): %s", anchors)
-
-    # boundary calculation: next exact header OR next major heading
-    full_end = len(base_doc.paragraphs) - 1
-    major_heading_idxs = [i for i,p in enumerate(base_doc.paragraphs) if is_major_heading(p.text)]
-    boundaries: Dict[int,int] = {}
-    anchor_indices_sorted = [idx for _, idx in anchors]
-
-    for i, (_, start_i) in enumerate(anchors):
-        next_anchor = anchor_indices_sorted[i+1] if i+1 < len(anchor_indices_sorted) else None
-        next_heading = next_index_after(start_i, major_heading_idxs)
+    for i, (_, start_i) in enumerate(anchors_pre):
+        next_anchor = anchor_indices_sorted_pre[i+1] if i+1 < len(anchor_indices_sorted_pre) else None
+        next_heading = next_index_after(start_i, major_heading_idxs_pre)
         candidates = []
         if next_anchor is not None: candidates.append(next_anchor - 1)
         if next_heading is not None: candidates.append(next_heading - 1)
-        boundary_end = min(candidates) if candidates else full_end
-        boundaries[start_i] = max(start_i, min(boundary_end, full_end))
+        boundary_end = min(candidates) if candidates else full_end_pre
+        boundaries_pre[start_i] = max(start_i, min(boundary_end, full_end_pre))
 
-    # metrics (resume text between header..boundary + JD numbers)
+    # extract numeric phrases from role block + JD to bias GPT toward quantification
     NUM_PHRASE_REGEX = re.compile(
         r"(\$?\d+(?:\.\d+)?\s?(?:k|m|bn|b|million|billion)?|\d+\s?(?:%|percent)|\d+\+\b|"
         r"\b\d+\s?(?:days?|weeks?|months?|years?)|\$\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d{1,3}%|\d{1,3}\s?%)",
@@ -538,8 +501,8 @@ def tailor():
         return extract_numeric_phrases("  ".join(buf))
 
     metrics_by_company: Dict[str, List[str]] = {}
-    for comp, start_i in anchors:
-        end_i = boundaries[start_i]
+    for comp, start_i in anchors_pre:
+        end_i = boundaries_pre[start_i]
         role_metrics = harvest_metrics(base_doc, start_i, end_i)
         jd_metrics = extract_numeric_phrases(job_desc)
         merged, seen = [], set()
@@ -548,10 +511,19 @@ def tailor():
                 seen.add(val); merged.append(val)
         metrics_by_company[comp] = merged[:20]
 
-    # bullets (one call)
+    # summary text
+    summary_prompt = (
+        f"Write {summary_sentences} sentence professional summary aligned to the job description below. "
+        f"Use concise, specific language; prefer quantified outcomes; avoid buzzwords and dashes.\n---\n{job_desc[:1500]}"
+    )
+    summary = sanitize(gpt(summary_prompt))
+
+    # bullets (single call for all roles)
     bullets_by_company = gpt_bullets_batch(experience, job_desc, style_rules, metrics_by_company)
 
-    # skills: keep originals; append deduped
+    # ---------- mutate doc (these edits shift indices)
+    write_summary(base_doc, summary)
+    # skills: keep originals; append deduped based on JD
     SKILL_BANK = {
         "Business Analysis & Delivery": [
             "Requirements elicitation","User stories","Acceptance criteria","UAT","BPMN","UML",
@@ -590,52 +562,49 @@ def tailor():
 
     skills_categories = skills_categories or list(SKILL_BANK.keys())
     skills_map = pick_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories}) if skills_categories else {}
+    inject_skills(base_doc, skills_map)
 
-    # apply summary & skills
-    doc = base_doc
-    write_summary(doc, summary)
-    inject_skills(doc, skills_map)
+    # ---------- pass 2: re-anchor AFTER edits (fresh indices for insertion)
+    anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
+    app.logger.info("Final anchors: %s", anchors)
 
-    # ---- STRICT REPLACE / APPEND per role header (bottom-up to keep indices stable)
+    full_end = len(base_doc.paragraphs) - 1
+    major_heading_idxs = [i for i,p in enumerate(base_doc.paragraphs) if is_major_heading(p.text)]
+    boundaries: Dict[int,int] = {}
+    anchor_indices_sorted = [idx for _, idx in anchors]
+
+    for i, (_, start_i) in enumerate(anchors):
+        next_anchor = anchor_indices_sorted[i+1] if i+1 < len(anchor_indices_sorted) else None
+        next_heading = next_index_after(start_i, major_heading_idxs)
+        candidates = []
+        if next_anchor is not None: candidates.append(next_anchor - 1)
+        if next_heading is not None: candidates.append(next_heading - 1)
+        boundary_end = min(candidates) if candidates else full_end
+        boundaries[start_i] = max(start_i, min(boundary_end, full_end))
+
+    # ---- insert per role (bottom-up to keep indices stable)
     if anchors:
         for idx in range(len(anchors)-1, -1, -1):
             comp, start_i = anchors[idx]
-            boundary_end = boundaries[start_i]
+            end_i = boundaries[start_i]
 
             if BULLETS_STRICT_REPLACE:
-                # Replace: delete everything under the header up to boundary, then insert below header
-                if boundary_end >= start_i + 1:
-                    delete_range(doc, start_i + 1, boundary_end)
-                insert_base = doc.paragraphs[start_i]
+                # delete everything under header
+                if end_i >= start_i + 1:
+                    delete_range(base_doc, start_i + 1, end_i)
+                insert_base = base_doc.paragraphs[start_i]  # insert right below header
             else:
-                # Append within section: place bullets AFTER any existing bullets just under this header;
-                # if none exist, place immediately under the header.
-                insert_base = doc.paragraphs[start_i]
-                j = start_i + 1
-                last_bullet_idx = None
-                while j <= boundary_end and j < len(doc.paragraphs):
-                    if is_major_heading(doc.paragraphs[j].text):
-                        break
-                    if is_bullet_para(doc.paragraphs[j]):
-                        last_bullet_idx = j
-                    else:
-                        # stop scanning once bullets stop (we only want bullets directly under the header)
-                        if last_bullet_idx is not None:
-                            break
-                    j += 1
-                if last_bullet_idx is not None:
-                    insert_base = doc.paragraphs[last_bullet_idx]
-                # else keep insert_base as the header paragraph
+                # append at end of the role block (AFTER existing bullets/paragraphs)
+                insert_base = base_doc.paragraphs[end_i] if end_i >= start_i else base_doc.paragraphs[start_i]
 
-            # Insert bullets immediately after chosen base
             last = insert_base
             for b in bullets_by_company.get(comp, []):
                 last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
     else:
-        app.logger.warning("No anchors detected from exact_headers; bullets not injected.")
+        app.logger.warning("No anchors detected; bullets not injected.")
 
     # send file
-    out = io.BytesIO(); doc.save(out); out.seek(0)
+    out = io.BytesIO(); base_doc.save(out); out.seek(0)
     resp = make_response(send_file(
         out,
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
