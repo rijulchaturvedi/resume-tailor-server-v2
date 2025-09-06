@@ -334,7 +334,7 @@ def replace_summary(doc: Document, summary: str):
 # Skills (Preserve & Append)
 # ----------------------------
 def parse_skills_section(doc: Document, s: int, e: int):
-    """Parse existing skills maintaining structure"""
+    """Parse existing skills maintaining structure and removing duplicates"""
     order = []
     mapping: Dict[str, List[str]] = {}
     current = None
@@ -346,7 +346,7 @@ def parse_skills_section(doc: Document, s: int, e: int):
             i += 1
             continue
             
-        # Category with colon
+        # Category with colon at the end
         if line.endswith(":"):
             current = _norm_heading(line[:-1].strip())
             if current not in mapping:
@@ -357,35 +357,52 @@ def parse_skills_section(doc: Document, s: int, e: int):
             if j <= e:
                 items_line = sanitize(doc.paragraphs[j].text)
                 if items_line and not items_line.endswith(":") and not is_major_heading(items_line):
-                    mapping[current].extend([x.strip() for x in items_line.split(",") if x.strip()])
+                    # Split and clean items
+                    items = [x.strip() for x in re.split(r'[,.]', items_line) if x.strip()]
+                    mapping[current].extend(items)
                     i = j
             i += 1
             continue
             
         # Inline category: items
         if ":" in line:
-            head, items = line.split(":", 1)
-            key = _norm_heading(head.strip())
-            if key not in mapping:
-                mapping[key] = []
-                order.append(key)
-            mapping[key].extend([x.strip() for x in items.split(",") if x.strip()])
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                head, items = parts
+                key = _norm_heading(head.strip())
+                if key not in mapping:
+                    mapping[key] = []
+                    order.append(key)
+                # Split and clean items, handle both comma and period separators
+                items_list = [x.strip() for x in re.split(r'[,.]', items) if x.strip()]
+                mapping[key].extend(items_list)
             i += 1
             continue
             
         # Continuation of previous category
         if current:
-            mapping[current].extend([x.strip() for x in line.split(",") if x.strip()])
+            items = [x.strip() for x in re.split(r'[,.]', line) if x.strip()]
+            mapping[current].extend(items)
         i += 1
     
-    # Deduplicate within each category
+    # Deduplicate within each category more aggressively
     for k, v in mapping.items():
         seen = set()
         deduped = []
         for item in v:
-            if item and item.lower() not in seen:
-                seen.add(item.lower())
-                deduped.append(item)
+            # Clean item further
+            item_clean = item.strip().rstrip(',').rstrip('.')
+            # Normalize for comparison (lowercase, remove extra spaces)
+            item_key = re.sub(r'\s+', ' ', item_clean.lower()).strip()
+            
+            # Skip if too short or already seen
+            if len(item_clean) > 2 and item_key not in seen:
+                seen.add(item_key)
+                # Also add variations to seen set
+                seen.add(item_key.replace('&', 'and'))
+                seen.add(item_key.replace('and', '&'))
+                deduped.append(item_clean)
+        
         mapping[k] = deduped
     
     return order, mapping
