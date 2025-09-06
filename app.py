@@ -362,7 +362,7 @@ def parse_skills_section(doc: Document, s: int, e: int):
     return order, mapping
 
 def rewrite_skills_section(doc: Document, s: int, e: int, order: List[str], mapping: Dict[str, List[str]]):
-    """Rewrite skills section with merged content and proper formatting"""
+    """Rewrite skills section with merged content and proper formatting - inline style"""
     if e >= s+1:
         delete_range(doc, s+1, e)
     
@@ -372,16 +372,19 @@ def rewrite_skills_section(doc: Document, s: int, e: int, order: List[str], mapp
     for cat in order:
         # Format category name
         formatted_cat = cat.title().replace(' And ', ' & ')
-        header = insert_paragraph_after(last, f"{formatted_cat}:")
-        set_paragraph_font(header)
-        
         items = mapping.get(cat, [])
+        
         if items:
-            items_para = insert_paragraph_after(header, ", ".join(items))
-            set_paragraph_font(items_para)
-            last = items_para
+            # Create single paragraph with category: items format (inline)
+            combined_text = f"{formatted_cat}: {', '.join(items)}"
+            skills_para = insert_paragraph_after(last, combined_text)
+            set_paragraph_font(skills_para)
+            last = skills_para
         else:
-            last = header
+            # Just the category if no items
+            cat_para = insert_paragraph_after(last, f"{formatted_cat}:")
+            set_paragraph_font(cat_para)
+            last = cat_para
 
 def merge_skills(doc: Document, new_skills: Dict[str, list]):
     """Preserve existing skills and append new ones"""
