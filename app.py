@@ -640,7 +640,7 @@ def tailor():
         out,
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         as_attachment=True,
-        download_name="Rijul_Chaturvedi_Tailored.docx",
+        download_name="Rijul_Chaturvedi.docx",
     ))
     resp.headers["Access-Control-Allow-Origin"] = origin
     resp.headers["Vary"] = "Origin"
