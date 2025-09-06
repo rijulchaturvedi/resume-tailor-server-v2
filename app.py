@@ -3,6 +3,8 @@ from flask_cors import CORS
 from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.oxml import OxmlElement
+from docx.shared import Pt
+from docx.oxml.ns import qn
 import io, os, json, re, logging
 from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
@@ -110,13 +112,33 @@ def delete_range(doc: Document, start: int, end: int):
             p = doc.paragraphs[i]._element
             p.getparent().remove(p)
 
+def set_paragraph_font(paragraph: Paragraph, font_name: str = "Times New Roman", font_size: int = 9):
+    """Set font for all runs in a paragraph"""
+    for run in paragraph.runs:
+        run.font.name = font_name
+        run.font.size = Pt(font_size)
+        # Set the font for both ASCII and East Asian text
+        rPr = run._element.get_or_add_rPr()
+        rFonts = rPr.get_or_add_rFonts()
+        rFonts.set(qn('w:ascii'), font_name)
+        rFonts.set(qn('w:hAnsi'), font_name)
+
 def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional[str] = None) -> Paragraph:
+    """Insert a new paragraph after the given paragraph with proper formatting"""
     new_p = OxmlElement("w:p")
     paragraph._p.addnext(new_p)
     new_para = Paragraph(new_p, paragraph._parent)
     run = None
     if text:
         run = new_para.add_run(text)
+        # Set font to Times New Roman, size 9
+        run.font.name = "Times New Roman"
+        run.font.size = Pt(9)
+        # Ensure font is set for both ASCII and East Asian text
+        rPr = run._element.get_or_add_rPr()
+        rFonts = rPr.get_or_add_rFonts()
+        rFonts.set(qn('w:ascii'), "Times New Roman")
+        rFonts.set(qn('w:hAnsi'), "Times New Roman")
     if style:
         try:
             new_para.style = style
@@ -179,33 +201,81 @@ def find_anchors_by_exact_headers(doc: Document, exact_headers: Dict[str,str]) -
     found.sort(key=lambda x: x[1])
     return found
 
+def is_bullet_point(text: str) -> bool:
+    """Check if a paragraph is a bullet point"""
+    text = text.strip()
+    # Check for common bullet markers including the special bullet character
+    bullet_markers = ['•', '●', '○', '■', '□', '▪', '▫', '-', '*', '>', '→', '·']
+    for marker in bullet_markers:
+        if text.startswith(marker):
+            return True
+    # Also check if it starts with a number followed by period or parenthesis (numbered list)
+    if re.match(r'^\d+[.)]\s', text):
+        return True
+    return False
+
 def find_role_section_bounds(doc: Document, header_idx: int) -> Tuple[int, int]:
-    """Find bounds of content under a role header"""
+    """Find bounds of ALL content under a role header, including all bullets"""
     content_start = header_idx + 1
     content_end = len(doc.paragraphs) - 1
     
+    # Continue until we hit a major heading or another role header
     for i in range(header_idx + 1, len(doc.paragraphs)):
         para_text = sanitize(doc.paragraphs[i].text)
-        if is_major_heading(para_text) or _is_role_header(para_text):
+        
+        # Stop at major headings
+        if is_major_heading(para_text):
+            content_end = i - 1
+            break
+        
+        # Stop at another role header
+        if _is_role_header(para_text, doc, i):
             content_end = i - 1
             break
     
     return content_start, content_end
 
-def _is_role_header(text: str) -> bool:
-    """Check if paragraph is a role header"""
+def _is_role_header(text: str, doc: Document = None, idx: int = None) -> bool:
+    """Enhanced check if paragraph is a role header"""
     text = sanitize(text).lower()
     if not text: return False
     
+    # Check for bold formatting (strong indicator of headers)
+    if doc and idx is not None and idx < len(doc.paragraphs):
+        para = doc.paragraphs[idx]
+        if para.runs and any(run.bold for run in para.runs):
+            # If it has bold text and contains role/company indicators
+            role_indicators = [
+                "analyst", "manager", "engineer", "developer", "consultant", 
+                "director", "specialist", "coordinator", "lead", "senior", "intern",
+                "advisor", "architect", "administrator", "officer"
+            ]
+            if any(keyword in text for keyword in role_indicators):
+                return True
+    
+    # Patterns that indicate role headers
     role_indicators = [
         "analyst", "manager", "engineer", "developer", "consultant", 
         "director", "specialist", "coordinator", "lead", "senior", "intern"
     ]
     
-    has_role = any(keyword in text for keyword in role_indicators)
-    has_date = bool(re.search(r'\b(19|20)\d{2}\b', text))
+    # Date patterns
+    has_date = bool(re.search(r'\b(19|20)\d{2}\b|present|current', text))
     
-    return has_role or has_date
+    # Company/location patterns
+    has_location = bool(re.search(r',\s*[A-Z]{2}\b|,\s*(ny|ca|tx|wa|il|ma)\b', text, re.IGNORECASE))
+    
+    has_role = any(keyword in text for keyword in role_indicators)
+    
+    # Strong indicators: role + date or role + location
+    if has_role and (has_date or has_location):
+        return True
+    
+    # Check for pattern like "Title, Company, Location Date"
+    if "," in text and (has_date or has_location):
+        return True
+    
+    return False
 
 # ----------------------------
 # Professional Summary (Replace)
@@ -218,13 +288,18 @@ def replace_summary(doc: Document, summary: str):
         # Delete all content under summary heading
         if e >= s+1:
             delete_range(doc, s+1, e)
-        # Insert new summary
-        insert_paragraph_after(doc.paragraphs[s], sanitize(summary))
+        # Insert new summary with proper formatting
+        new_para = insert_paragraph_after(doc.paragraphs[s], sanitize(summary))
+        set_paragraph_font(new_para)
     else:
         # Add new summary section if not exists
         h = doc.add_paragraph()
-        h.add_run("PROFESSIONAL SUMMARY").bold = True
-        doc.add_paragraph(sanitize(summary))
+        run = h.add_run("PROFESSIONAL SUMMARY")
+        run.bold = True
+        run.font.name = "Times New Roman"
+        run.font.size = Pt(9)
+        p = doc.add_paragraph(sanitize(summary))
+        set_paragraph_font(p)
 
 # ----------------------------
 # Skills (Preserve & Append)
@@ -287,7 +362,7 @@ def parse_skills_section(doc: Document, s: int, e: int):
     return order, mapping
 
 def rewrite_skills_section(doc: Document, s: int, e: int, order: List[str], mapping: Dict[str, List[str]]):
-    """Rewrite skills section with merged content"""
+    """Rewrite skills section with merged content and proper formatting"""
     if e >= s+1:
         delete_range(doc, s+1, e)
     
@@ -298,10 +373,13 @@ def rewrite_skills_section(doc: Document, s: int, e: int, order: List[str], mapp
         # Format category name
         formatted_cat = cat.title().replace(' And ', ' & ')
         header = insert_paragraph_after(last, f"{formatted_cat}:")
+        set_paragraph_font(header)
         
         items = mapping.get(cat, [])
         if items:
-            last = insert_paragraph_after(header, ", ".join(items))
+            items_para = insert_paragraph_after(header, ", ".join(items))
+            set_paragraph_font(items_para)
+            last = items_para
         else:
             last = header
 
@@ -315,7 +393,10 @@ def merge_skills(doc: Document, new_skills: Dict[str, list]):
     if not spans:
         # Create skills section if not exists
         h = doc.add_paragraph()
-        h.add_run("SKILLS & TOOLS").bold = True
+        run = h.add_run("SKILLS & TOOLS")
+        run.bold = True
+        run.font.name = "Times New Roman"
+        run.font.size = Pt(9)
         spans = find_all_section_bounds(doc, ["SKILLS & TOOLS","SKILLS AND TOOLS"])
     
     if not spans:
@@ -631,7 +712,7 @@ def tailor():
     skills_map = pick_relevant_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories})
     merge_skills(base_doc, skills_map)
     
-    # MODIFICATION 1: Replace bullets completely
+    # MODIFICATION 1: Replace bullets completely (delete ALL old bullets)
     anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
     
     if anchors:
@@ -639,16 +720,24 @@ def tailor():
         for idx in range(len(anchors)-1, -1, -1):
             comp, header_idx = anchors[idx]
             
-            # Find content bounds
+            # Find content bounds (this includes ALL bullets under the role)
             content_start, content_end = find_role_section_bounds(base_doc, header_idx)
             
-            app.logger.info(f"Replacing bullets for {comp}: deleting {content_start}-{content_end}")
+            app.logger.info(f"Replacing bullets for {comp}: header at {header_idx}, content {content_start}-{content_end}")
             
-            # Delete ALL existing content
+            # Count how many bullets we're deleting
+            bullets_deleted = 0
+            for i in range(content_start, min(content_end + 1, len(base_doc.paragraphs))):
+                if is_bullet_point(base_doc.paragraphs[i].text):
+                    bullets_deleted += 1
+            
+            app.logger.info(f"Deleting {bullets_deleted} existing bullets for {comp}")
+            
+            # Delete ALL existing content (including all bullets)
             if content_end >= content_start:
                 delete_range(base_doc, content_start, content_end)
             
-            # Insert new bullets
+            # Insert new bullets with proper formatting
             insert_base = base_doc.paragraphs[header_idx]
             last = insert_base
             
@@ -657,9 +746,13 @@ def tailor():
                 bullet_text = sanitize(bullet)
                 if not bullet_text.startswith("•"):
                     bullet_text = f"• {bullet_text}"
-                last = insert_paragraph_after(last, bullet_text)
+                new_para = insert_paragraph_after(last, bullet_text)
+                set_paragraph_font(new_para)  # Set Times New Roman, 9pt
+                last = new_para
+            
+            app.logger.info(f"Inserted {len(bullets_by_company.get(comp, []))} new bullets for {comp}")
     
-    # MODIFICATION 4: Generate filename without "Tailored"
+    # MODIFICATION 4: Generate filename WITHOUT "Tailored"
     today = datetime.now().strftime("%Y-%m-%d")
     filename = f"Rijul_Chaturvedi_{today}.docx"
     
