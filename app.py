@@ -715,7 +715,7 @@ def tailor():
     skills_map = pick_relevant_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories})
     merge_skills(base_doc, skills_map)
     
-    # MODIFICATION 1: Replace bullets completely (delete ALL old bullets)
+    # MODIFICATION 1: Replace bullets completely (delete old, insert new)
     anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
     
     if anchors:
@@ -723,68 +723,24 @@ def tailor():
         for idx in range(len(anchors)-1, -1, -1):
             comp, header_idx = anchors[idx]
             
-            # Find content bounds (this includes ALL bullets under the role)
+            # Find content bounds
             content_start, content_end = find_role_section_bounds(base_doc, header_idx)
             
-            app.logger.info(f"Processing {comp}: header at {header_idx}, content range {content_start}-{content_end}")
+            app.logger.info(f"Processing {comp}: header at {header_idx}, content {content_start}-{content_end}")
             
-            # AGGRESSIVE DELETION: Delete everything that looks like content under the role
-            # This includes bullets and any other content paragraphs
-            paragraphs_to_delete = []
+            # Simply delete ALL content between header and next section
+            # This is cleaner than trying to identify individual bullets
+            if content_end >= content_start and content_start < len(base_doc.paragraphs):
+                # Delete everything in the content range
+                delete_range(base_doc, content_start, content_end)
+                app.logger.info(f"Deleted content from {content_start} to {content_end} for {comp}")
             
-            for i in range(content_start, min(content_end + 1, len(base_doc.paragraphs))):
-                para_text = base_doc.paragraphs[i].text.strip()
-                
-                # Skip empty paragraphs
-                if not para_text:
-                    continue
-                
-                # Delete if:
-                # 1. It's identified as a bullet
-                # 2. It starts with a dash/hyphen (any type)
-                # 3. It contains "Lead" or "Design" at the start (specific to the problematic bullets)
-                # 4. It's a substantial paragraph (likely content, not a heading)
-                should_delete = False
-                
-                # Check various conditions
-                if is_bullet_point(base_doc.paragraphs[i].text):
-                    should_delete = True
-                elif para_text.startswith('-') or para_text.startswith('–') or para_text.startswith('—'):
-                    should_delete = True
-                elif para_text.startswith('•') or para_text.startswith('·'):
-                    should_delete = True
-                elif re.match(r'^(Lead|Design|Develop|Manage|Create|Build|Implement)', para_text, re.IGNORECASE):
-                    should_delete = True
-                elif len(para_text) > 50 and not is_major_heading(para_text):
-                    # Long paragraphs that aren't headings are likely content
-                    should_delete = True
-                
-                if should_delete:
-                    paragraphs_to_delete.append(i)
-                    app.logger.info(f"  Marking for deletion at {i}: {para_text[:60]}...")
-            
-            # Delete in reverse order
-            app.logger.info(f"Deleting {len(paragraphs_to_delete)} paragraphs for {comp}")
-            for i in reversed(paragraphs_to_delete):
-                p = base_doc.paragraphs[i]._element
-                p.getparent().remove(p)
-            
-            # Now insert new bullets with proper formatting
-            # Re-find the header since indices have changed
-            header_idx_new = None
-            for i, p in enumerate(base_doc.paragraphs):
-                if sanitize(p.text) == sanitize(exact_headers.get(comp, "")):
-                    header_idx_new = i
-                    break
-            
-            if header_idx_new is None:
-                app.logger.warning(f"Could not re-find header for {comp} after deletion")
-                continue
-            
-            insert_base = base_doc.paragraphs[header_idx_new]
+            # Insert new bullets right after the header
+            insert_base = base_doc.paragraphs[header_idx]
             last = insert_base
             
-            for bullet in bullets_by_company.get(comp, []):
+            new_bullets = bullets_by_company.get(comp, [])
+            for bullet in new_bullets:
                 # Ensure bullet starts with bullet point
                 bullet_text = sanitize(bullet)
                 if not bullet_text.startswith("•"):
@@ -793,7 +749,7 @@ def tailor():
                 set_paragraph_font(new_para)  # Set Times New Roman, 9pt
                 last = new_para
             
-            app.logger.info(f"Inserted {len(bullets_by_company.get(comp, []))} new bullets for {comp}")
+            app.logger.info(f"Inserted {len(new_bullets)} new bullets for {comp}")
     
     # MODIFICATION 4: Generate filename WITHOUT "Tailored"
     today = datetime.now().strftime("%Y-%m-%d")
