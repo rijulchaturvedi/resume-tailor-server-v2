@@ -647,24 +647,23 @@ def tailor():
         with open(base_path, "rb") as f:
             base_doc = ensure_docx(f)
     
-    # Extract metrics from existing content
+    # Extract metrics from existing content BEFORE making any changes
     anchors_pre = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
     
     metrics_by_company: Dict[str, List[str]] = {}
     for comp, start_i in anchors_pre:
-        content_start, content_end = find_role_section_bounds(base_doc, start_i)
-        
-        # Extract metrics from role section
+        # For metrics extraction, look at ALL content until next major section
         buf = []
-        for i in range(content_start, min(content_end + 1, len(base_doc.paragraphs))):
+        for i in range(start_i + 1, len(base_doc.paragraphs)):
             t = sanitize(base_doc.paragraphs[i].text)
+            if is_major_heading(t):
+                break
             if t:
                 buf.append(t)
         
         role_metrics = extract_numeric_phrases(" ".join(buf))
         jd_metrics = extract_numeric_phrases(job_desc)
         
-        # Merge metrics
         merged = []
         seen = set()
         for val in role_metrics + jd_metrics:
@@ -673,6 +672,7 @@ def tailor():
                 merged.append(val)
         
         metrics_by_company[comp] = merged[:20]
+        app.logger.info(f"Extracted {len(role_metrics)} metrics for {comp}")
     
     # Generate professional summary
     summary_prompt = (
@@ -744,38 +744,70 @@ def tailor():
     skills_map = pick_relevant_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories})
     merge_skills(base_doc, skills_map)
     
-    # MODIFICATION 1: Replace bullets completely (delete old, insert new)
+    # MODIFICATION 1: Replace bullets - DELETE ALL content between role header and next section
+    # Re-find anchors after summary/skills changes
     anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
     
     if anchors:
-        # Process in reverse order to maintain indices
-        for idx in range(len(anchors)-1, -1, -1):
-            comp, header_idx = anchors[idx]
+        # Process each role in FORWARD order but track what we've processed
+        processed_indices = set()
+        
+        for comp, header_idx in anchors:
+            if header_idx in processed_indices:
+                continue
+            processed_indices.add(header_idx)
             
-            # Find content bounds
-            content_start, content_end = find_role_section_bounds(base_doc, header_idx)
+            app.logger.info(f"\nProcessing {comp} at index {header_idx}")
+            app.logger.info(f"Header text: '{base_doc.paragraphs[header_idx].text}'")
             
-            app.logger.info(f"Processing {comp}: header at {header_idx}, content {content_start}-{content_end}")
+            # Find ALL content for this role (including bullets with dashes)
+            content_indices = []
+            i = header_idx + 1
             
-            # Simply delete ALL content between header and next section
-            # This is cleaner than trying to identify individual bullets
-            if content_end >= content_start and content_start < len(base_doc.paragraphs):
-                # Delete everything in the content range
-                delete_range(base_doc, content_start, content_end)
-                app.logger.info(f"Deleted content from {content_start} to {content_end} for {comp}")
+            # Continue collecting content until we hit another role or major section
+            while i < len(base_doc.paragraphs):
+                para_text = base_doc.paragraphs[i].text.strip()
+                
+                # Stop at major sections
+                if is_major_heading(para_text):
+                    app.logger.info(f"  Stopping at major heading: '{para_text[:50]}'")
+                    break
+                
+                # Check if this is another role header (has bold and role patterns)
+                para = base_doc.paragraphs[i]
+                has_bold = any(run.bold for run in para.runs) if para.runs else False
+                
+                if has_bold and para_text:
+                    # Check for another company role pattern
+                    if comp not in para_text:  # Not the current company
+                        if any(co in para_text for co in ["Frappe Technologies", "Ernst & Young", "iConsult Collaborative"]):
+                            app.logger.info(f"  Stopping at next role: '{para_text[:50]}'")
+                            break
+                
+                # Include this paragraph as content (even if empty)
+                content_indices.append(i)
+                if para_text:
+                    app.logger.info(f"  Including content at {i}: '{para_text[:60]}...'")
+                
+                i += 1
             
-            # Insert new bullets right after the header
-            insert_base = base_doc.paragraphs[header_idx]
-            last = insert_base
+            # Delete all content for this role
+            if content_indices:
+                app.logger.info(f"Deleting {len(content_indices)} paragraphs for {comp}")
+                for idx in reversed(content_indices):
+                    p = base_doc.paragraphs[idx]._element
+                    p.getparent().remove(p)
             
+            # Insert new bullets
             new_bullets = bullets_by_company.get(comp, [])
+            last = base_doc.paragraphs[header_idx]
+            
             for bullet in new_bullets:
-                # Ensure bullet starts with bullet point
                 bullet_text = sanitize(bullet)
                 if not bullet_text.startswith("•"):
                     bullet_text = f"• {bullet_text}"
                 new_para = insert_paragraph_after(last, bullet_text)
-                set_paragraph_font(new_para)  # Set Times New Roman, 9pt
+                set_paragraph_font(new_para)
                 last = new_para
             
             app.logger.info(f"Inserted {len(new_bullets)} new bullets for {comp}")
