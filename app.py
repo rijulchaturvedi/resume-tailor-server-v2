@@ -92,9 +92,11 @@ def ensure_docx(doc_or_bytes):
         raise RuntimeError(f"Failed to open DOCX: {e}")
 
 def delete_range(doc: Document, start: int, end: int):
+    """Delete paragraphs from start to end (inclusive)"""
     for i in range(end, start-1, -1):
-        p = doc.paragraphs[i]._element
-        p.getparent().remove(p)
+        if i < len(doc.paragraphs):
+            p = doc.paragraphs[i]._element
+            p.getparent().remove(p)
 
 def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional[str] = None) -> Paragraph:
     new_p = OxmlElement("w:p")
@@ -178,6 +180,47 @@ def next_index_after(idx: int, arr: List[int]) -> Optional[int]:
     for a in arr:
         if a > idx: return a
     return None
+
+def find_role_section_bounds(doc: Document, header_idx: int) -> Tuple[int, int]:
+    """
+    Find the bounds of content under a role header.
+    Returns (content_start, content_end) where content_start is the first paragraph
+    after the header and content_end is the last paragraph before the next major section.
+    """
+    content_start = header_idx + 1
+    content_end = len(doc.paragraphs) - 1
+    
+    # Find the next major heading to determine where this role section ends
+    for i in range(header_idx + 1, len(doc.paragraphs)):
+        para_text = sanitize(doc.paragraphs[i].text)
+        if is_major_heading(para_text) or _is_role_header(para_text):
+            content_end = i - 1
+            break
+    
+    return content_start, content_end
+
+def _is_role_header(text: str) -> bool:
+    """Check if a paragraph looks like a role header (contains role/company info)"""
+    text = sanitize(text)
+    # Look for patterns like "Title, Company" or "**Title,** Company"
+    # This is a heuristic - you might need to adjust based on your resume format
+    if not text:
+        return False
+    
+    # Common indicators of role headers
+    role_indicators = [
+        "analyst", "manager", "engineer", "developer", "consultant", 
+        "director", "specialist", "coordinator", "lead", "senior"
+    ]
+    
+    text_lower = text.lower()
+    has_role_keyword = any(keyword in text_lower for keyword in role_indicators)
+    
+    # Check if it has bold formatting or other formatting that suggests it's a header
+    # (This is approximate since we're just looking at text)
+    has_formatting_clues = any(marker in text for marker in ["**", "•", "-"])
+    
+    return has_role_keyword and (has_formatting_clues or len(text.split()) <= 10)
 
 # ----------------------------
 # KPI placeholder / quantification
@@ -463,20 +506,7 @@ def tailor():
 
     # ---------- pass 1: locate anchors to harvest metrics (pre-edit)
     anchors_pre = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
-    full_end_pre = len(base_doc.paragraphs) - 1
-    major_heading_idxs_pre = [i for i,p in enumerate(base_doc.paragraphs) if is_major_heading(p.text)]
-    boundaries_pre: Dict[int,int] = {}
-    anchor_indices_sorted_pre = [idx for _, idx in anchors_pre]
-
-    for i, (_, start_i) in enumerate(anchors_pre):
-        next_anchor = anchor_indices_sorted_pre[i+1] if i+1 < len(anchor_indices_sorted_pre) else None
-        next_heading = next_index_after(start_i, major_heading_idxs_pre)
-        candidates = []
-        if next_anchor is not None: candidates.append(next_anchor - 1)
-        if next_heading is not None: candidates.append(next_heading - 1)
-        boundary_end = min(candidates) if candidates else full_end_pre
-        boundaries_pre[start_i] = max(start_i, min(boundary_end, full_end_pre))
-
+    
     # extract numeric phrases from role block + JD to bias GPT toward quantification
     NUM_PHRASE_REGEX = re.compile(
         r"(\$?\d+(?:\.\d+)?\s?(?:k|m|bn|b|million|billion)?|\d+\s?(?:%|percent)|\d+\+\b|"
@@ -502,8 +532,8 @@ def tailor():
 
     metrics_by_company: Dict[str, List[str]] = {}
     for comp, start_i in anchors_pre:
-        end_i = boundaries_pre[start_i]
-        role_metrics = harvest_metrics(base_doc, start_i, end_i)
+        content_start, content_end = find_role_section_bounds(base_doc, start_i)
+        role_metrics = harvest_metrics(base_doc, start_i, content_end)
         jd_metrics = extract_numeric_phrases(job_desc)
         merged, seen = [], set()
         for val in role_metrics + jd_metrics:
@@ -523,6 +553,7 @@ def tailor():
 
     # ---------- mutate doc (these edits shift indices)
     write_summary(base_doc, summary)
+    
     # skills: keep originals; append deduped based on JD
     SKILL_BANK = {
         "Business Analysis & Delivery": [
@@ -568,38 +599,38 @@ def tailor():
     anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
     app.logger.info("Final anchors: %s", anchors)
 
-    full_end = len(base_doc.paragraphs) - 1
-    major_heading_idxs = [i for i,p in enumerate(base_doc.paragraphs) if is_major_heading(p.text)]
-    boundaries: Dict[int,int] = {}
-    anchor_indices_sorted = [idx for _, idx in anchors]
-
-    for i, (_, start_i) in enumerate(anchors):
-        next_anchor = anchor_indices_sorted[i+1] if i+1 < len(anchor_indices_sorted) else None
-        next_heading = next_index_after(start_i, major_heading_idxs)
-        candidates = []
-        if next_anchor is not None: candidates.append(next_anchor - 1)
-        if next_heading is not None: candidates.append(next_heading - 1)
-        boundary_end = min(candidates) if candidates else full_end
-        boundaries[start_i] = max(start_i, min(boundary_end, full_end))
-
-    # ---- insert per role (bottom-up to keep indices stable)
+    # ---- Replace content under each role section (process in reverse order to maintain indices)
     if anchors:
         for idx in range(len(anchors)-1, -1, -1):
-            comp, start_i = anchors[idx]
-            end_i = boundaries[start_i]
-
+            comp, header_idx = anchors[idx]
+            
+            # Find the content bounds for this role section
+            content_start, content_end = find_role_section_bounds(base_doc, header_idx)
+            
+            app.logger.info(f"Processing {comp}: header_idx={header_idx}, content_start={content_start}, content_end={content_end}")
+            
             if BULLETS_STRICT_REPLACE:
-                # delete everything under header
-                if end_i >= start_i + 1:
-                    delete_range(base_doc, start_i + 1, end_i)
-                insert_base = base_doc.paragraphs[start_i]  # insert right below header
+                # Delete all existing content under this role header
+                if content_end >= content_start:
+                    app.logger.info(f"Deleting range {content_start} to {content_end}")
+                    delete_range(base_doc, content_start, content_end)
+                
+                # Insert new bullets right after the header
+                insert_base = base_doc.paragraphs[header_idx]
+                last = insert_base
+                for bullet in bullets_by_company.get(comp, []):
+                    last = insert_paragraph_after(last, sanitize(bullet), style="List Bullet")
+                    app.logger.info(f"Inserted bullet: {sanitize(bullet)[:50]}...")
             else:
-                # append at end of the role block (AFTER existing bullets/paragraphs)
-                insert_base = base_doc.paragraphs[end_i] if end_i >= start_i else base_doc.paragraphs[start_i]
-
-            last = insert_base
-            for b in bullets_by_company.get(comp, []):
-                last = insert_paragraph_after(last, sanitize(b), style="List Bullet")
+                # Append at end of the role block (after existing content)
+                if content_end >= 0 and content_end < len(base_doc.paragraphs):
+                    insert_base = base_doc.paragraphs[content_end]
+                else:
+                    insert_base = base_doc.paragraphs[header_idx]
+                
+                last = insert_base
+                for bullet in bullets_by_company.get(comp, []):
+                    last = insert_paragraph_after(last, sanitize(bullet), style="List Bullet")
     else:
         app.logger.warning("No anchors detected; bullets not injected.")
 
