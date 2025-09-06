@@ -223,17 +223,46 @@ def find_role_section_bounds(doc: Document, header_idx: int) -> Tuple[int, int]:
     for i in range(header_idx + 1, len(doc.paragraphs)):
         para_text = sanitize(doc.paragraphs[i].text)
         
-        # Stop at major headings
+        # Skip empty paragraphs - they don't mark the end
+        if not para_text:
+            continue
+        
+        # Check if it's a major heading (EDUCATION, CERTIFICATIONS, etc.)
         if is_major_heading(para_text):
             content_end = i - 1
             break
         
-        # Stop at another role header
-        if _is_role_header(para_text, doc, i):
-            content_end = i - 1
+        # Check if it's another role header (has bold text and role keywords)
+        # But be careful not to stop at bullets
+        if i > header_idx + 1:  # Don't check the very first line after header
+            para = doc.paragraphs[i]
+            # Check if paragraph has bold formatting (typical of role headers)
+            has_bold = any(run.bold for run in para.runs)
+            
+            # Only consider it a new role if it has bold AND looks like a role title
+            if has_bold and _is_role_header(para_text, doc, i):
+                # Double-check it's not a bullet by checking for bullet markers
+                if not any(para_text.strip().startswith(marker) for marker in ['•', '·', '-', '*', '▪', '▫']):
+                    content_end = i - 1
+                    break
+    
+    # Extend the end to include any bullets that might follow
+    # Look for continuous content that looks like bullets
+    actual_end = content_end
+    for i in range(content_end + 1, min(content_end + 10, len(doc.paragraphs))):
+        para_text = doc.paragraphs[i].text.strip()
+        # If it's a bullet-like line, include it
+        if para_text and (para_text.startswith('-') or para_text.startswith('•') or 
+                         para_text.startswith('·') or len(para_text) > 40):
+            actual_end = i
+        # Stop if we hit a clear section header
+        elif is_major_heading(para_text):
+            break
+        # Stop if we hit another role header with bold
+        elif any(run.bold for run in doc.paragraphs[i].runs):
             break
     
-    return content_start, content_end
+    return content_start, actual_end
 
 def _is_role_header(text: str, doc: Document = None, idx: int = None) -> bool:
     """Enhanced check if paragraph is a role header"""
