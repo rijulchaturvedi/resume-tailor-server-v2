@@ -6,6 +6,7 @@ from docx.oxml import OxmlElement
 import io, os, json, re, logging
 from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from datetime import datetime
 
 # ----------------------------
 # App & CORS
@@ -17,7 +18,7 @@ app.logger.setLevel(logging.INFO)
 # ----------------------------
 # OpenAI config
 # ----------------------------
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # or "gpt-5" if you prefer
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").strip().lower() not in ("0", "false", "no")
@@ -30,8 +31,8 @@ def _env_bool(name: str, default: bool=False) -> bool:
     if v is None: return default
     return v.strip().lower() in ("1","true","yes","on","y")
 
-# Behavior toggles (overridable via JSON options)
-SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
+# Behavior toggles
+SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", False)
 BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
 
 try:
@@ -47,15 +48,26 @@ KNOWN_HEADINGS = {
     "PROFESSIONAL SUMMARY","SUMMARY",
     "EXPERIENCE","WORK EXPERIENCE","PROFESSIONAL EXPERIENCE",
     "SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS",
-    "EDUCATION","PROJECTS","CERTIFICATIONS","PUBLICATIONS","ACHIEVEMENTS"
+    "EDUCATION","PROJECTS","CERTIFICATIONS","PUBLICATIONS","ACHIEVEMENTS","ACADEMIC PROJECTS"
 }
+
+def humanize_text(text: str) -> str:
+    """Remove AI-style dashes and make text more natural"""
+    if not text: return ""
+    # Replace em/en dashes with simple hyphens or commas
+    text = text.replace("—", ", ").replace("–", ", ")
+    # Replace smart quotes with regular quotes
+    text = re.sub(r"[\u201c\u201d]", '"', text)
+    text = re.sub(r"[\u2018\u2019]", "'", text)
+    # Remove excessive punctuation patterns common in AI text
+    text = re.sub(r'\s*,\s*,+', ',', text)
+    text = re.sub(r'\s*;\s*;+', ';', text)
+    return text.strip()
 
 def sanitize(text: str) -> str:
     if not text: return ""
     text = text.replace("\u00A0", " ").replace("\t", " ")
-    text = text.replace("—","-").replace("–","-")
-    text = re.sub(r"[\u201c\u201d]", '"', text)
-    text = re.sub(r"[\u2018\u2019]", "'", text)
+    text = humanize_text(text)
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
 
@@ -74,7 +86,7 @@ def _norm_heading(text: str) -> str:
 
 def is_major_heading(text: str) -> bool:
     t = _norm_heading(text)
-    return (not t) or t in KNOWN_HEADINGS or t.isupper()
+    return (not t) or t in KNOWN_HEADINGS or (t.isupper() and len(t.split()) <= 4)
 
 # ----------------------------
 # DOCX utils
@@ -109,7 +121,6 @@ def insert_paragraph_after(paragraph: Paragraph, text: str = "", style: Optional
         try:
             new_para.style = style
         except KeyError:
-            # fallback bullet glyph if "List Bullet" style isn't present
             if run and style.lower().startswith("list") and not run.text.strip().startswith("•"):
                 run.text = f"• {run.text}"
     return new_para
@@ -148,49 +159,31 @@ def find_all_section_bounds(doc: Document, titles: List[str]) -> List[Tuple[int,
             i += 1
     return spans
 
-def exactish_match(line: str, target: str) -> bool:
-    L = _canon(line); T = _canon(target)
-    if not L or not T: return False
-    return L == T or (T in L)
-
 def find_anchors_by_exact_headers(doc: Document, exact_headers: Dict[str,str]) -> List[Tuple[str,int]]:
-    """ exact_headers: { company -> exact visible header line in the DOCX } """
     pairs = [(sanitize(k), v) for k, v in exact_headers.items()]
     found = []
     used = set()
     for comp, header in pairs:
         idx = None
-        # strict equality on sanitized text
         for i, p in enumerate(doc.paragraphs):
             if sanitize(p.text) == sanitize(header):
                 idx = i; break
-        # fallback: canon contains
         if idx is None:
             for i, p in enumerate(doc.paragraphs):
-                if exactish_match(p.text, header):
+                if _canon(header) in _canon(p.text):
                     idx = i; break
         if idx is not None and idx not in used:
             found.append((comp, idx)); used.add(idx)
         else:
-            app.logger.warning("Exact header NOT found for %s -> '%s'", comp, header)
+            app.logger.warning("Header NOT found for %s -> '%s'", comp, header)
     found.sort(key=lambda x: x[1])
     return found
 
-def next_index_after(idx: int, arr: List[int]) -> Optional[int]:
-    for a in arr:
-        if a > idx: return a
-    return None
-
 def find_role_section_bounds(doc: Document, header_idx: int) -> Tuple[int, int]:
-    """
-    Find the bounds of content under a role header.
-    Returns (content_start, content_end) where content_start is the first paragraph
-    after the header and content_end is the last paragraph before the next major section.
-    """
+    """Find bounds of content under a role header"""
     content_start = header_idx + 1
     content_end = len(doc.paragraphs) - 1
     
-    # Find the next major heading to determine where this role section ends
     for i in range(header_idx + 1, len(doc.paragraphs)):
         para_text = sanitize(doc.paragraphs[i].text)
         if is_major_heading(para_text) or _is_role_header(para_text):
@@ -200,46 +193,159 @@ def find_role_section_bounds(doc: Document, header_idx: int) -> Tuple[int, int]:
     return content_start, content_end
 
 def _is_role_header(text: str) -> bool:
-    """Check if a paragraph looks like a role header (contains role/company info)"""
-    text = sanitize(text)
-    # Look for patterns like "Title, Company" or "**Title,** Company"
-    # This is a heuristic - you might need to adjust based on your resume format
-    if not text:
-        return False
+    """Check if paragraph is a role header"""
+    text = sanitize(text).lower()
+    if not text: return False
     
-    # Common indicators of role headers
     role_indicators = [
         "analyst", "manager", "engineer", "developer", "consultant", 
-        "director", "specialist", "coordinator", "lead", "senior"
+        "director", "specialist", "coordinator", "lead", "senior", "intern"
     ]
     
-    text_lower = text.lower()
-    has_role_keyword = any(keyword in text_lower for keyword in role_indicators)
+    has_role = any(keyword in text for keyword in role_indicators)
+    has_date = bool(re.search(r'\b(19|20)\d{2}\b', text))
     
-    # Check if it has bold formatting or other formatting that suggests it's a header
-    # (This is approximate since we're just looking at text)
-    has_formatting_clues = any(marker in text for marker in ["**", "•", "-"])
-    
-    return has_role_keyword and (has_formatting_clues or len(text.split()) <= 10)
+    return has_role or has_date
 
 # ----------------------------
-# KPI placeholder / quantification
+# Professional Summary (Replace)
 # ----------------------------
-QUANT_REGEX = re.compile(
-    r"(\d|\$|%|\bhrs?\b|\bhour(s)?\b|\bday(s)?\b|\bweek(s)?\b|\bmonth(s)?\b|\byear(s)?\b|\b\d{1,3}k\b)",
-    re.IGNORECASE
-)
-def ensure_quantified(bullets: List[str], placeholder: str = "quantified impact: KPI TBD") -> List[str]:
-    if not SHOW_KPI_PLACEHOLDER:
-        return [sanitize(b) for b in bullets]
-    out = []
-    for b in bullets:
-        t = sanitize(b)
-        out.append(t if QUANT_REGEX.search(t) else f"{t} ({placeholder})")
-    return out
+def replace_summary(doc: Document, summary: str):
+    """Replace existing summary completely"""
+    sec = find_section_bounds(doc, ["PROFESSIONAL SUMMARY","SUMMARY"])
+    if sec:
+        s, e = sec
+        # Delete all content under summary heading
+        if e >= s+1:
+            delete_range(doc, s+1, e)
+        # Insert new summary
+        insert_paragraph_after(doc.paragraphs[s], sanitize(summary))
+    else:
+        # Add new summary section if not exists
+        h = doc.add_paragraph()
+        h.add_run("PROFESSIONAL SUMMARY").bold = True
+        doc.add_paragraph(sanitize(summary))
 
 # ----------------------------
-# OpenAI
+# Skills (Preserve & Append)
+# ----------------------------
+def parse_skills_section(doc: Document, s: int, e: int):
+    """Parse existing skills maintaining structure"""
+    order = []
+    mapping: Dict[str, List[str]] = {}
+    current = None
+    i = s + 1
+    
+    while i <= e and i < len(doc.paragraphs):
+        line = sanitize(doc.paragraphs[i].text)
+        if not line:
+            i += 1
+            continue
+            
+        # Category with colon
+        if line.endswith(":"):
+            current = _norm_heading(line[:-1].strip())
+            if current not in mapping:
+                mapping[current] = []
+                order.append(current)
+            # Check next line for items
+            j = i + 1
+            if j <= e:
+                items_line = sanitize(doc.paragraphs[j].text)
+                if items_line and not items_line.endswith(":") and not is_major_heading(items_line):
+                    mapping[current].extend([x.strip() for x in items_line.split(",") if x.strip()])
+                    i = j
+            i += 1
+            continue
+            
+        # Inline category: items
+        if ":" in line:
+            head, items = line.split(":", 1)
+            key = _norm_heading(head.strip())
+            if key not in mapping:
+                mapping[key] = []
+                order.append(key)
+            mapping[key].extend([x.strip() for x in items.split(",") if x.strip()])
+            i += 1
+            continue
+            
+        # Continuation of previous category
+        if current:
+            mapping[current].extend([x.strip() for x in line.split(",") if x.strip()])
+        i += 1
+    
+    # Deduplicate within each category
+    for k, v in mapping.items():
+        seen = set()
+        deduped = []
+        for item in v:
+            if item and item.lower() not in seen:
+                seen.add(item.lower())
+                deduped.append(item)
+        mapping[k] = deduped
+    
+    return order, mapping
+
+def rewrite_skills_section(doc: Document, s: int, e: int, order: List[str], mapping: Dict[str, List[str]]):
+    """Rewrite skills section with merged content"""
+    if e >= s+1:
+        delete_range(doc, s+1, e)
+    
+    anchor = doc.paragraphs[s]
+    last = anchor
+    
+    for cat in order:
+        # Format category name
+        formatted_cat = cat.title().replace(' And ', ' & ')
+        header = insert_paragraph_after(last, f"{formatted_cat}:")
+        
+        items = mapping.get(cat, [])
+        if items:
+            last = insert_paragraph_after(header, ", ".join(items))
+        else:
+            last = header
+
+def merge_skills(doc: Document, new_skills: Dict[str, list]):
+    """Preserve existing skills and append new ones"""
+    if not new_skills:
+        return
+    
+    spans = find_all_section_bounds(doc, ["SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS"])
+    
+    if not spans:
+        # Create skills section if not exists
+        h = doc.add_paragraph()
+        h.add_run("SKILLS & TOOLS").bold = True
+        spans = find_all_section_bounds(doc, ["SKILLS & TOOLS","SKILLS AND TOOLS"])
+    
+    if not spans:
+        return
+    
+    first_s = spans[0][0]
+    last_e = spans[-1][1]
+    
+    # Parse existing skills
+    order, mapping = parse_skills_section(doc, first_s, last_e)
+    
+    # Merge new skills (append only, no replacement)
+    for cat, additions in new_skills.items():
+        key = _norm_heading(cat)
+        if key not in mapping:
+            mapping[key] = []
+            order.append(key)
+        
+        existing = set(x.lower() for x in mapping[key])
+        for item in (additions or []):
+            t = sanitize(item)
+            if t and t.lower() not in existing:
+                mapping[key].append(t)
+                existing.add(t.lower())
+    
+    # Rewrite section with merged content
+    rewrite_skills_section(doc, first_s, last_e, order, mapping)
+
+# ----------------------------
+# OpenAI Integration
 # ----------------------------
 def _get_client():
     if not OPENAI_API_KEY or not _openai_available or not OAI_ENABLED:
@@ -250,197 +356,126 @@ def _get_client():
         app.logger.exception("OpenAI client init failed: %s", e)
         return None
 
-def _gpt_call_chat(client, system, prompt) -> str:
+def _gpt_call(client, system, prompt) -> str:
     resp = client.chat.completions.create(
         model=MODEL,
         messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
+        temperature=0.3  # Lower temperature for consistency
     )
     return resp.choices[0].message.content.strip()
 
-def _gpt_call_resp(client, system, prompt) -> str:
-    if not hasattr(client, "responses"):
-        raise AttributeError("Responses API not available in this SDK")
-    resp = client.responses.create(
-        model=MODEL,
-        input=[{"role":"system","content":system},{"role":"user","content":prompt}],
-    )
-    if hasattr(resp, "output_text"):
-        return str(resp.output_text).strip()
-    if hasattr(resp, "output") and resp.output:
-        parts = []
-        for item in resp.output:
-            content = getattr(item, "content", [])
-            if content and hasattr(content[0], "text"):
-                parts.append(content[0].text)
-        if parts:
-            return sanitize(" ".join(parts))
-    return sanitize(str(resp))
-
-def gpt(prompt: str, system: str = "You are a helpful writing assistant.") -> str:
+def gpt(prompt: str, system: str = "You are a professional resume writer. Write in a natural, human style without AI markers.") -> str:
     client = _get_client()
     if client is None:
         return "Placeholder output (model disabled or key missing)."
     try:
-        if USE_RESPONSES_API and hasattr(client, "responses"):
-            return EXECUTOR.submit(_gpt_call_resp, client, system, prompt).result(timeout=OAI_BUDGET)
-        return EXECUTOR.submit(_gpt_call_chat, client, system, prompt).result(timeout=OAI_BUDGET)
-    except FuturesTimeout:
-        app.logger.warning("OpenAI call timed out; using placeholder.")
-        return "Placeholder output due to timeout."
+        result = EXECUTOR.submit(_gpt_call, client, system, prompt).result(timeout=OAI_BUDGET)
+        return humanize_text(result)
     except Exception as e:
-        app.logger.warning("OpenAI error; using placeholder: %s", e)
+        app.logger.warning("OpenAI error: %s", e)
         return "Placeholder output due to model error."
 
 # ----------------------------
-# Summary & Skills (keep originals; append new)
-# ----------------------------
-def write_summary(doc: Document, summary: str):
-    sec = find_section_bounds(doc, ["PROFESSIONAL SUMMARY","SUMMARY"])
-    if sec:
-        s,e = sec
-        if e >= s+1: delete_range(doc, s+1, e)
-        insert_paragraph_after(doc.paragraphs[s], sanitize(summary))
-    else:
-        h = doc.add_paragraph(); h.add_run("PROFESSIONAL SUMMARY").bold = True
-        doc.add_paragraph(sanitize(summary))
-
-def parse_skills_section(doc: Document, s: int, e: int):
-    order = []
-    mapping: Dict[str, List[str]] = {}
-    current = None
-    i = s + 1
-    while i <= e and i < len(doc.paragraphs):
-        line = sanitize(doc.paragraphs[i].text)
-        if not line:
-            i += 1; continue
-        if line.endswith(":"):
-            current = _norm_heading(line[:-1].strip())
-            if current not in mapping:
-                mapping[current] = []
-                order.append(current)
-            j = i + 1
-            if j <= e:
-                items_line = sanitize(doc.paragraphs[j].text)
-                if items_line and not items_line.endswith(":") and not is_major_heading(items_line):
-                    mapping[current].extend([x.strip() for x in items_line.split(",") if x.strip()])
-                    i = j
-            i += 1
-            continue
-        if ":" in line:
-            head, items = line.split(":", 1)
-            key = _norm_heading(head.strip())
-            if key not in mapping:
-                mapping[key] = []
-                order.append(key)
-            mapping[key].extend([x.strip() for x in items.split(",") if x.strip()])
-            i += 1
-            continue
-        if current:
-            mapping[current].extend([x.strip() for x in line.split(",") if x.strip()])
-        i += 1
-    for k,v in mapping.items():
-        vv=[]; seen=set()
-        for x in v:
-            if x and x.lower() not in seen:
-                seen.add(x.lower()); vv.append(x)
-        mapping[k] = vv
-    return order, mapping
-
-def rewrite_skills_section(doc: Document, s: int, e: int, order: List[str], mapping: Dict[str, List[str]]):
-    if e >= s+1:
-        delete_range(doc, s+1, e)
-    anchor = doc.paragraphs[s]
-    last = anchor
-    for cat in order:
-        header = insert_paragraph_after(last, f"{cat.title().replace(' And ',' & ')}:")
-        items = mapping.get(cat, [])
-        if items:
-            last = insert_paragraph_after(header, ", ".join(items))
-        else:
-            last = header
-
-def inject_skills(doc: Document, new_skills: Dict[str, list]):
-    if not new_skills: return
-    spans = find_all_section_bounds(doc, ["SKILLS","CORE SKILLS","TECHNICAL SKILLS","SKILLS & TOOLS","SKILLS AND TOOLS"])
-    if not spans:
-        h = doc.add_paragraph(); h.add_run("SKILLS & TOOLS").bold = True
-        spans = find_all_section_bounds(doc, ["SKILLS & TOOLS","SKILLS AND TOOLS"])
-    first_s = spans[0][0]
-    last_e = spans[-1][1]
-    order, mapping = parse_skills_section(doc, first_s, last_e)
-    for cat, additions in new_skills.items():
-        key = _norm_heading(cat)
-        if key not in mapping:
-            mapping[key] = []
-            order.append(key)
-        existing = set(x.lower() for x in mapping[key])
-        for item in (additions or []):
-            t = sanitize(item)
-            if t and t.lower() not in existing:
-                mapping[key].append(t)
-                existing.add(t.lower())
-    rewrite_skills_section(doc, first_s, last_e, order, mapping)
-
-# ----------------------------
-# GPT bullets (batch generation)
+# Enhanced GPT Bullets Generation
 # ----------------------------
 def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str], metrics_by_company: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Generate humanized, quantified bullets"""
     entries = []
     for e in experience:
         k = int(e.get("bullets", 0) or 0)
         if k <= 0: continue
-        comp = sanitize(e.get("company","")); role = sanitize(e.get("role",""))
+        comp = sanitize(e.get("company",""))
+        role = sanitize(e.get("role",""))
         mx = metrics_by_company.get(comp, [])
         entries.append(f'- company: "{comp}"; role: "{role}"; bullets: {k}; metrics: [{", ".join(mx)}]')
+    
     if not entries:
         return {sanitize(e.get("company","")): [] for e in experience}
-
+    
+    # Enhanced style rules for human-like output
     rules_txt = "\n".join(f"- {r}" for r in (style_rules or [
-        "20–28 words each",
-        "Start with a strong verb; past tense",
-        "Use provided metrics naturally (%, $, counts, time); do NOT invent numbers",
-        "No company names inside bullets",
-        "Avoid buzzwords; focus on actions and outcomes",
+        "20 to 28 words each bullet",
+        "Start with strong action verb in past tense",
+        "Include specific numbers and percentages naturally (use provided metrics)",
+        "Never use em/en dashes, use commas or 'by' instead",
+        "Write like a human, not AI (avoid overly formal language)",
+        "Focus on measurable business impact and outcomes",
+        "Use simple connecting words like 'and', 'by', 'through'",
+        "Each bullet must contain at least one quantified metric"
     ]))
+    
+    prompt = f"""Generate resume bullets that sound natural and human-written. Return ONLY valid JSON.
 
-    prompt = f"""Return ONLY JSON (no code fences) mapping company name to an array of bullet strings.
+CRITICAL: Write naturally without AI markers. Use numbers extensively. Replace dashes with commas or 'by'.
 
-Entries (each entry may include 'metrics' that you can use verbatim):
+Entries:
 {chr(10).join(entries)}
 
-Rules:
+Style Rules:
 {rules_txt}
 
-Job description (trimmed):
----
+Job Description Focus:
 {jd[:1500]}
----
 
-JSON schema example:
+Return JSON like:
 {{
-  "Company A": ["bullet 1", "bullet 2"],
-  "Company B": ["bullet 1", "bullet 2", "bullet 3"]
+  "Company Name": ["Achieved X by doing Y, resulting in Z% improvement", "Led team of N to deliver..."]
 }}"""
 
-    text = gpt(prompt, system="You produce strict JSON only. No commentary.")
+    text = gpt(prompt, system="You are a professional resume writer. Generate human-sounding, quantified bullets. Return only valid JSON.")
+    
     try:
         data = json.loads(text)
     except Exception:
         data = {}
         for e in experience:
-            comp = sanitize(e.get("company","")); k = int(e.get("bullets", 0) or 0)
-            role = sanitize(e.get("role",""))
-            data[comp] = [f"Drove outcomes in '{role}' aligned to JD" for _ in range(max(k,0))]
-
+            comp = sanitize(e.get("company",""))
+            k = int(e.get("bullets", 0) or 0)
+            data[comp] = [f"Delivered measurable outcomes aligned with role responsibilities" for _ in range(max(k,0))]
+    
+    # Process and humanize bullets
     out = {}
     for e in experience:
-        comp = sanitize(e.get("company","")); k = int(e.get("bullets", 0) or 0)
-        bullets = [sanitize(b) for b in (data.get(comp) or [])][:k]
-        out[comp] = ensure_quantified(bullets)
+        comp = sanitize(e.get("company",""))
+        k = int(e.get("bullets", 0) or 0)
+        bullets = []
+        
+        for b in (data.get(comp) or [])[:k]:
+            # Additional humanization
+            b = humanize_text(b)
+            # Ensure quantification
+            if not re.search(r'\d+', b):
+                b = f"{b} achieving measurable results"
+            bullets.append(sanitize(b))
+        
+        out[comp] = bullets[:k]
+    
     return out
 
 # ----------------------------
-# Routes
+# Metrics Extraction
+# ----------------------------
+def extract_numeric_phrases(text: str, max_phrases: int = 15) -> List[str]:
+    """Extract quantified metrics from text"""
+    NUM_REGEX = re.compile(
+        r"(\$?\d+(?:\.\d+)?[KMB]?\b|\d+\+?\s*%|\d+\s*(?:hours?|days?|weeks?|months?|years?)|"
+        r"\$\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d{1,3}%|\d+x\b|\d+\s*million|\d+\s*billion)",
+        re.IGNORECASE
+    )
+    
+    found = []
+    seen = set()
+    for m in NUM_REGEX.finditer(text or ""):
+        val = sanitize(m.group(0))
+        if val and val.lower() not in seen:
+            found.append(val)
+            seen.add(val.lower())
+            if len(found) >= max_phrases:
+                break
+    return found
+
+# ----------------------------
+# Main Route
 # ----------------------------
 @app.route("/")
 def index():
@@ -454,12 +489,13 @@ def health():
 @app.route("/tailor", methods=["POST","OPTIONS"])
 def tailor():
     origin = request.headers.get("Origin", "*")
-
-    # parse JSON or multipart
+    
+    # Parse request
     if request.content_type and "multipart/form-data" in request.content_type.lower():
         base_resume_file = request.files.get("base_resume")
         payload_part = request.form.get("payload")
-        if not payload_part: return make_response(("missing payload", 400))
+        if not payload_part:
+            return make_response(("missing payload", 400))
         try:
             data = json.loads(payload_part)
         except Exception:
@@ -470,31 +506,25 @@ def tailor():
         except Exception:
             return make_response(("invalid json", 400))
         base_resume_file = None
-
-    # toggles (can be overridden by options)
+    
+    # Options
     global SHOW_KPI_PLACEHOLDER, BULLETS_STRICT_REPLACE
-    SHOW_KPI_PLACEHOLDER = _env_bool("SHOW_KPI_PLACEHOLDER", True)
-    BULLETS_STRICT_REPLACE = _env_bool("BULLETS_STRICT_REPLACE", True)
-    opts = (data.get("options") or {})
-    if "show_kpi_placeholder" in opts: SHOW_KPI_PLACEHOLDER = bool(opts["show_kpi_placeholder"])
-    if "strict_replace" in opts: BULLETS_STRICT_REPLACE = bool(opts["strict_replace"])
-    app.logger.info("Toggles -> strict_replace=%s, show_kpi_placeholder=%s",
-                    BULLETS_STRICT_REPLACE, SHOW_KPI_PLACEHOLDER)
-
-    # exact headers (company -> exact visible header line)
+    BULLETS_STRICT_REPLACE = True  # Always replace bullets
+    opts = data.get("options", {})
+    
     exact_headers: Dict[str,str] = {}
     if "exact_headers" in opts and isinstance(opts["exact_headers"], dict):
-        exact_headers = { sanitize(k): v for k, v in opts["exact_headers"].items() if v }
-
-    # inputs
+        exact_headers = {sanitize(k): v for k, v in opts["exact_headers"].items() if v}
+    
+    # Inputs
     job_desc = sanitize(data.get("job_description",""))
-    cfg = (data.get("resume_config") or {}) or {}
+    cfg = data.get("resume_config", {})
     summary_sentences = int(cfg.get("summary_sentences", 2))
-    experience = cfg.get("experience",[]) or []
-    skills_categories = cfg.get("skills_categories",[]) or []
-    style_rules = (opts.get("style_rules") or [])
-
-    # base resume
+    experience = cfg.get("experience", [])
+    skills_categories = cfg.get("skills_categories", [])
+    style_rules = opts.get("style_rules", [])
+    
+    # Load base resume
     if base_resume_file:
         base_doc = ensure_docx(base_resume_file)
     else:
@@ -503,149 +533,151 @@ def tailor():
             return make_response(("server missing base_resume.docx", 500))
         with open(base_path, "rb") as f:
             base_doc = ensure_docx(f)
-
-    # ---------- pass 1: locate anchors to harvest metrics (pre-edit)
+    
+    # Extract metrics from existing content
     anchors_pre = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
     
-    # extract numeric phrases from role block + JD to bias GPT toward quantification
-    NUM_PHRASE_REGEX = re.compile(
-        r"(\$?\d+(?:\.\d+)?\s?(?:k|m|bn|b|million|billion)?|\d+\s?(?:%|percent)|\d+\+\b|"
-        r"\b\d+\s?(?:days?|weeks?|months?|years?)|\$\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d{1,3}%|\d{1,3}\s?%)",
-        re.IGNORECASE
-    )
-    def extract_numeric_phrases(text: str, max_phrases: int = 12) -> List[str]:
-        found = []
-        for m in NUM_PHRASE_REGEX.finditer(text or ""):
-            val = sanitize(m.group(0))
-            if val and val not in found:
-                found.append(val)
-            if len(found) >= max_phrases: break
-        return found
-
-    def harvest_metrics(doc: Document, start_idx: int, end_idx: int) -> List[str]:
-        buf = []
-        for i in range(start_idx + 1, min(end_idx + 1, len(doc.paragraphs))):
-            t = sanitize(doc.paragraphs[i].text)
-            if not t or is_major_heading(t): break
-            buf.append(t)
-        return extract_numeric_phrases("  ".join(buf))
-
     metrics_by_company: Dict[str, List[str]] = {}
     for comp, start_i in anchors_pre:
         content_start, content_end = find_role_section_bounds(base_doc, start_i)
-        role_metrics = harvest_metrics(base_doc, start_i, content_end)
+        
+        # Extract metrics from role section
+        buf = []
+        for i in range(content_start, min(content_end + 1, len(base_doc.paragraphs))):
+            t = sanitize(base_doc.paragraphs[i].text)
+            if t:
+                buf.append(t)
+        
+        role_metrics = extract_numeric_phrases(" ".join(buf))
         jd_metrics = extract_numeric_phrases(job_desc)
-        merged, seen = [], set()
+        
+        # Merge metrics
+        merged = []
+        seen = set()
         for val in role_metrics + jd_metrics:
             if val not in seen:
-                seen.add(val); merged.append(val)
+                seen.add(val)
+                merged.append(val)
+        
         metrics_by_company[comp] = merged[:20]
-
-    # summary text
+    
+    # Generate professional summary
     summary_prompt = (
-        f"Write {summary_sentences} sentence professional summary aligned to the job description below. "
-        f"Use concise, specific language; prefer quantified outcomes; avoid buzzwords and dashes.\n---\n{job_desc[:1500]}"
+        f"Write exactly {summary_sentences} sentences for a professional summary. "
+        f"Use natural language with specific achievements and numbers. "
+        f"Avoid AI-style writing markers like dashes. Use 'and', 'through', 'by' as connectors.\n\n"
+        f"Job Description:\n{job_desc[:1500]}"
     )
     summary = sanitize(gpt(summary_prompt))
-
-    # bullets (single call for all roles)
-    bullets_by_company = gpt_bullets_batch(experience, job_desc, style_rules, metrics_by_company)
-
-    # ---------- mutate doc (these edits shift indices)
-    write_summary(base_doc, summary)
     
-    # skills: keep originals; append deduped based on JD
+    # Generate bullets
+    bullets_by_company = gpt_bullets_batch(experience, job_desc, style_rules, metrics_by_company)
+    
+    # MODIFICATION 1 & 3: Replace summary completely
+    replace_summary(base_doc, summary)
+    
+    # MODIFICATION 2: Preserve original skills, append new ones
     SKILL_BANK = {
         "Business Analysis & Delivery": [
             "Requirements elicitation","User stories","Acceptance criteria","UAT","BPMN","UML",
-            "Process re-engineering","Traceability (RTM)","Fit–gap","Prioritization (RICE, MoSCoW)"
+            "Process re-engineering","Traceability (RTM)","Business case development"
         ],
         "Project & Program Management": [
-            "Agile Scrum","Kanban","SDLC","RACI","RAID","Sprint planning","Roadmapping","Stakeholder management"
+            "Agile Scrum","Kanban","SDLC","RACI","Sprint planning","Roadmapping","Stakeholder management"
         ],
-        "Data, Analytics & BI": [
-            "SQL","Python","Pandas","NumPy","Power BI","Tableau","A/B testing","Forecasting","Anomaly detection"
+        "Data Analytics & BI": [
+            "SQL","Python","Pandas","NumPy","Power BI","Tableau","A/B testing","Forecasting"
         ],
-        "Cloud, Data & MLOps": [
-            "AWS Lambda","S3","Redshift","Airflow","dbt","Spark","Databricks","ETL/ELT orchestration"
+        "Cloud Data & MLOps": [
+            "AWS Lambda","S3","Redshift","Airflow","dbt","Spark","Databricks","ETL/ELT"
         ],
-        "AI, ML & GenAI": [
-            "LLMs","RAG","Prompt design","Hugging Face","FAISS","Model monitoring","Inference optimization"
+        "AI ML & GenAI": [
+            "LLMs","RAG","Prompt design","Hugging Face","FAISS","Model monitoring"
         ],
-        "Enterprise Platforms & Integration": [
-            "Salesforce","NetSuite","SAP","ServiceNow","REST APIs","Postman","Git","Azure DevOps","Jira"
+        "Enterprise Platforms": [
+            "Salesforce","NetSuite","SAP","ServiceNow","REST APIs","Jira","Confluence"
         ],
-        "Collaboration, Design & Stakeholder": [
-            "Miro","Figma","Lucidchart","Wireframing","Prototyping","Executive communication","Workshops"
-        ],
+        "Collaboration Design": [
+            "Miro","Figma","Lucidchart","Wireframing","Executive communication","Workshops"
+        ]
     }
-    def pick_skills(jd: str, bank: Dict[str, List[str]], top_k: int = 8) -> Dict[str, List[str]]:
-        jd_l = jd.lower(); out={}
+    
+    def pick_relevant_skills(jd: str, bank: Dict[str, List[str]], top_k: int = 6) -> Dict[str, List[str]]:
+        jd_lower = jd.lower()
+        out = {}
         for cat, items in bank.items():
-            hits=[]
-            for s in items:
-                pat = re.escape(s.lower()).replace(r"\ ", r"\s+")
-                if re.search(rf"(?<![A-Za-z0-9]){pat}(?![A-Za-z0-9])", jd_l):
-                    hits.append(s)
-            seen=set(); merged=[x for x in hits+items if (x not in seen and not seen.add(x))]
-            out[cat] = merged[:top_k]
+            relevant = []
+            for skill in items:
+                pattern = re.escape(skill.lower()).replace(r"\ ", r"\s*")
+                if re.search(rf"\b{pattern}\b", jd_lower):
+                    relevant.append(skill)
+            
+            # Take relevant skills first, then fill with others
+            seen = set()
+            merged = []
+            for s in relevant + items:
+                if s not in seen:
+                    seen.add(s)
+                    merged.append(s)
+                    if len(merged) >= top_k:
+                        break
+            
+            if merged:
+                out[cat] = merged
+        
         return out
-
+    
     skills_categories = skills_categories or list(SKILL_BANK.keys())
-    skills_map = pick_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories}) if skills_categories else {}
-    inject_skills(base_doc, skills_map)
-
-    # ---------- pass 2: re-anchor AFTER edits (fresh indices for insertion)
+    skills_map = pick_relevant_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories})
+    merge_skills(base_doc, skills_map)
+    
+    # MODIFICATION 1: Replace bullets completely
     anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
-    app.logger.info("Final anchors: %s", anchors)
-
-    # ---- Replace content under each role section (process in reverse order to maintain indices)
+    
     if anchors:
+        # Process in reverse order to maintain indices
         for idx in range(len(anchors)-1, -1, -1):
             comp, header_idx = anchors[idx]
             
-            # Find the content bounds for this role section
+            # Find content bounds
             content_start, content_end = find_role_section_bounds(base_doc, header_idx)
             
-            app.logger.info(f"Processing {comp}: header_idx={header_idx}, content_start={content_start}, content_end={content_end}")
+            app.logger.info(f"Replacing bullets for {comp}: deleting {content_start}-{content_end}")
             
-            if BULLETS_STRICT_REPLACE:
-                # Delete all existing content under this role header
-                if content_end >= content_start:
-                    app.logger.info(f"Deleting range {content_start} to {content_end}")
-                    delete_range(base_doc, content_start, content_end)
-                
-                # Insert new bullets right after the header
-                insert_base = base_doc.paragraphs[header_idx]
-                last = insert_base
-                for bullet in bullets_by_company.get(comp, []):
-                    last = insert_paragraph_after(last, sanitize(bullet), style="List Bullet")
-                    app.logger.info(f"Inserted bullet: {sanitize(bullet)[:50]}...")
-            else:
-                # Append at end of the role block (after existing content)
-                if content_end >= 0 and content_end < len(base_doc.paragraphs):
-                    insert_base = base_doc.paragraphs[content_end]
-                else:
-                    insert_base = base_doc.paragraphs[header_idx]
-                
-                last = insert_base
-                for bullet in bullets_by_company.get(comp, []):
-                    last = insert_paragraph_after(last, sanitize(bullet), style="List Bullet")
-    else:
-        app.logger.warning("No anchors detected; bullets not injected.")
-
-    # send file
-    out = io.BytesIO(); base_doc.save(out); out.seek(0)
+            # Delete ALL existing content
+            if content_end >= content_start:
+                delete_range(base_doc, content_start, content_end)
+            
+            # Insert new bullets
+            insert_base = base_doc.paragraphs[header_idx]
+            last = insert_base
+            
+            for bullet in bullets_by_company.get(comp, []):
+                # Ensure bullet starts with bullet point
+                bullet_text = sanitize(bullet)
+                if not bullet_text.startswith("•"):
+                    bullet_text = f"• {bullet_text}"
+                last = insert_paragraph_after(last, bullet_text)
+    
+    # MODIFICATION 4: Generate filename without "Tailored"
+    today = datetime.now().strftime("%Y-%m-%d")
+    filename = f"Rijul_Chaturvedi_{today}.docx"
+    
+    # Save and send
+    out = io.BytesIO()
+    base_doc.save(out)
+    out.seek(0)
+    
     resp = make_response(send_file(
         out,
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         as_attachment=True,
-        download_name="Rijul_Chaturvedi.docx",
+        download_name=filename,
     ))
     resp.headers["Access-Control-Allow-Origin"] = origin
     resp.headers["Vary"] = "Origin"
     return resp
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT","8000"))
+    port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
