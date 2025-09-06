@@ -726,22 +726,62 @@ def tailor():
             # Find content bounds (this includes ALL bullets under the role)
             content_start, content_end = find_role_section_bounds(base_doc, header_idx)
             
-            app.logger.info(f"Replacing bullets for {comp}: header at {header_idx}, content {content_start}-{content_end}")
+            app.logger.info(f"Processing {comp}: header at {header_idx}, content range {content_start}-{content_end}")
             
-            # Count how many bullets we're deleting
-            bullets_deleted = 0
+            # AGGRESSIVE DELETION: Delete everything that looks like content under the role
+            # This includes bullets and any other content paragraphs
+            paragraphs_to_delete = []
+            
             for i in range(content_start, min(content_end + 1, len(base_doc.paragraphs))):
+                para_text = base_doc.paragraphs[i].text.strip()
+                
+                # Skip empty paragraphs
+                if not para_text:
+                    continue
+                
+                # Delete if:
+                # 1. It's identified as a bullet
+                # 2. It starts with a dash/hyphen (any type)
+                # 3. It contains "Lead" or "Design" at the start (specific to the problematic bullets)
+                # 4. It's a substantial paragraph (likely content, not a heading)
+                should_delete = False
+                
+                # Check various conditions
                 if is_bullet_point(base_doc.paragraphs[i].text):
-                    bullets_deleted += 1
+                    should_delete = True
+                elif para_text.startswith('-') or para_text.startswith('–') or para_text.startswith('—'):
+                    should_delete = True
+                elif para_text.startswith('•') or para_text.startswith('·'):
+                    should_delete = True
+                elif re.match(r'^(Lead|Design|Develop|Manage|Create|Build|Implement)', para_text, re.IGNORECASE):
+                    should_delete = True
+                elif len(para_text) > 50 and not is_major_heading(para_text):
+                    # Long paragraphs that aren't headings are likely content
+                    should_delete = True
+                
+                if should_delete:
+                    paragraphs_to_delete.append(i)
+                    app.logger.info(f"  Marking for deletion at {i}: {para_text[:60]}...")
             
-            app.logger.info(f"Deleting {bullets_deleted} existing bullets for {comp}")
+            # Delete in reverse order
+            app.logger.info(f"Deleting {len(paragraphs_to_delete)} paragraphs for {comp}")
+            for i in reversed(paragraphs_to_delete):
+                p = base_doc.paragraphs[i]._element
+                p.getparent().remove(p)
             
-            # Delete ALL existing content (including all bullets)
-            if content_end >= content_start:
-                delete_range(base_doc, content_start, content_end)
+            # Now insert new bullets with proper formatting
+            # Re-find the header since indices have changed
+            header_idx_new = None
+            for i, p in enumerate(base_doc.paragraphs):
+                if sanitize(p.text) == sanitize(exact_headers.get(comp, "")):
+                    header_idx_new = i
+                    break
             
-            # Insert new bullets with proper formatting
-            insert_base = base_doc.paragraphs[header_idx]
+            if header_idx_new is None:
+                app.logger.warning(f"Could not re-find header for {comp} after deletion")
+                continue
+            
+            insert_base = base_doc.paragraphs[header_idx_new]
             last = insert_base
             
             for bullet in bullets_by_company.get(comp, []):
