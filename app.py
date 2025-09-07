@@ -509,14 +509,17 @@ def gpt(prompt: str, system: str = "You are a professional resume writer. Write 
 # Enhanced GPT Bullets Generation
 # ----------------------------
 def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str], metrics_by_company: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """Generate humanized, quantified bullets"""
+    """Generate humanized, quantified bullets - ENSURES EXACT COUNT"""
     entries = []
+    bullet_counts = {}  # Store requested counts
+    
     for e in experience:
         k = int(e.get("bullets", 0) or 0)
         if k <= 0: continue
         comp = sanitize(e.get("company",""))
         role = sanitize(e.get("role",""))
         mx = metrics_by_company.get(comp, [])
+        bullet_counts[comp] = k  # Remember requested count
         entries.append(f'- company: "{comp}"; role: "{role}"; bullets: {k}; metrics: [{", ".join(mx)}]')
     
     if not entries:
@@ -536,9 +539,12 @@ def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str], m
     
     prompt = f"""Generate resume bullets that sound natural and human-written. Return ONLY valid JSON.
 
-CRITICAL: Write naturally without AI markers. Use numbers extensively. Replace dashes with commas or 'by'.
+CRITICAL: 
+1. Write naturally without AI markers. Use numbers extensively. Replace dashes with commas or 'by'.
+2. YOU MUST PROVIDE EXACTLY THE NUMBER OF BULLETS SPECIFIED FOR EACH COMPANY. No more, no less.
+3. If you cannot think of enough unique bullets, create variations that highlight different aspects of the role.
 
-Entries:
+Entries (IMPORTANT: Generate EXACTLY the number of bullets specified):
 {chr(10).join(entries)}
 
 Style Rules:
@@ -547,38 +553,70 @@ Style Rules:
 Job Description Focus:
 {jd[:1500]}
 
-Return JSON like:
+Return JSON with EXACTLY the specified number of bullets for each company:
 {{
-  "Company Name": ["Achieved X by doing Y, resulting in Z% improvement", "Led team of N to deliver..."]
+  "Company Name": ["bullet 1", "bullet 2", "...exactly as many as specified"]
 }}"""
 
-    text = gpt(prompt, system="You are a professional resume writer. Generate human-sounding, quantified bullets. Return only valid JSON.")
+    text = gpt(prompt, system="You are a professional resume writer. Generate human-sounding, quantified bullets. Return only valid JSON with EXACTLY the requested number of bullets for each company.")
     
     try:
         data = json.loads(text)
     except Exception:
         data = {}
-        for e in experience:
-            comp = sanitize(e.get("company",""))
-            k = int(e.get("bullets", 0) or 0)
-            data[comp] = [f"Delivered measurable outcomes aligned with role responsibilities" for _ in range(max(k,0))]
     
-    # Process and humanize bullets
+    # Ensure exact bullet count for each company
     out = {}
     for e in experience:
         comp = sanitize(e.get("company",""))
         k = int(e.get("bullets", 0) or 0)
-        bullets = []
         
-        for b in (data.get(comp) or [])[:k]:
-            # Additional humanization
-            b = humanize_text(b)
-            # Ensure quantification
+        if k <= 0:
+            out[comp] = []
+            continue
+        
+        # Get bullets from GPT response
+        gpt_bullets = [sanitize(humanize_text(b)) for b in (data.get(comp) or [])]
+        
+        # Ensure exactly k bullets
+        if len(gpt_bullets) >= k:
+            # If we have enough or more, take exactly k
+            bullets = gpt_bullets[:k]
+        else:
+            # If we have fewer, generate fallback bullets to fill the gap
+            bullets = gpt_bullets
+            fallback_templates = [
+                f"Enhanced operational efficiency by implementing data-driven solutions aligned with {e.get('role', 'role')} objectives",
+                f"Collaborated with stakeholders to deliver measurable improvements in key performance metrics",
+                f"Drove process improvements resulting in quantifiable business value and enhanced team productivity",
+                f"Managed complex initiatives that contributed to organizational goals and client satisfaction",
+                f"Developed innovative approaches to challenges, achieving significant cost savings and efficiency gains",
+                f"Led strategic projects that delivered substantial ROI and improved business outcomes"
+            ]
+            
+            while len(bullets) < k:
+                # Add a fallback bullet (cycle through templates)
+                template_idx = (len(bullets) - len(gpt_bullets)) % len(fallback_templates)
+                fallback = fallback_templates[template_idx]
+                # Add some metrics if available
+                if metrics_by_company.get(comp):
+                    metric = metrics_by_company[comp][len(bullets) % len(metrics_by_company[comp])]
+                    fallback = f"{fallback}, achieving {metric} improvement"
+                bullets.append(sanitize(fallback))
+        
+        # Ensure quantification
+        final_bullets = []
+        for b in bullets:
             if not re.search(r'\d+', b):
+                # Add a generic metric if none exists
                 b = f"{b} achieving measurable results"
-            bullets.append(sanitize(b))
+            final_bullets.append(b)
         
-        out[comp] = bullets[:k]
+        out[comp] = final_bullets[:k]  # Ensure exactly k bullets
+        
+        # Log if we had to adjust
+        if len(gpt_bullets) != k:
+            app.logger.warning(f"GPT returned {len(gpt_bullets)} bullets for {comp}, expected {k}. Adjusted to match.")
     
     return out
 
