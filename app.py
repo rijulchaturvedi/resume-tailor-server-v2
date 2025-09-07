@@ -761,64 +761,93 @@ def tailor():
     skills_map = pick_relevant_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories})
     merge_skills(base_doc, skills_map)
     
-    # MODIFICATION 1: Replace bullets - DELETE ALL content between role header and next section
+    # MODIFICATION 1: Replace bullets - FIXED VERSION
     # Re-find anchors after summary/skills changes
     anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
     
     if anchors:
-        # Process each role in FORWARD order but track what we've processed
-        processed_indices = set()
+        app.logger.info(f"\n{'='*60}")
+        app.logger.info(f"Starting bullet replacement for {len(anchors)} roles")
         
-        for comp, header_idx in anchors:
-            if header_idx in processed_indices:
+        # Process each company one at a time
+        for comp, _ in anchors:
+            app.logger.info(f"\nProcessing {comp}")
+            
+            # Find the header for this company (fresh search each time)
+            header_idx = None
+            header_text = exact_headers.get(comp, "")
+            for i, para in enumerate(base_doc.paragraphs):
+                if sanitize(para.text) == sanitize(header_text):
+                    header_idx = i
+                    break
+            
+            if header_idx is None:
+                app.logger.warning(f"Could not find header for {comp}")
                 continue
-            processed_indices.add(header_idx)
             
-            app.logger.info(f"\nProcessing {comp} at index {header_idx}")
-            app.logger.info(f"Header text: '{base_doc.paragraphs[header_idx].text}'")
+            app.logger.info(f"Found {comp} header at index {header_idx}")
             
-            # Find ALL content for this role (including bullets with dashes)
-            content_indices = []
+            # Find all content to delete (everything until next header or section)
+            indices_to_delete = []
             i = header_idx + 1
             
-            # Continue collecting content until we hit another role or major section
             while i < len(base_doc.paragraphs):
                 para_text = base_doc.paragraphs[i].text.strip()
                 
-                # Stop at major sections
+                # Stop if we hit a major section
                 if is_major_heading(para_text):
-                    app.logger.info(f"  Stopping at major heading: '{para_text[:50]}'")
+                    app.logger.info(f"  Stopping at major heading: {para_text[:50]}")
                     break
                 
-                # Check if this is another role header (has bold and role patterns)
+                # Check if this is another role header
                 para = base_doc.paragraphs[i]
                 has_bold = any(run.bold for run in para.runs) if para.runs else False
                 
+                # If it has bold and contains a company name (not current company)
                 if has_bold and para_text:
-                    # Check for another company role pattern
-                    if comp not in para_text:  # Not the current company
-                        if any(co in para_text for co in ["Frappe Technologies", "Ernst & Young", "iConsult Collaborative"]):
-                            app.logger.info(f"  Stopping at next role: '{para_text[:50]}'")
+                    # Check if this is a different company's header
+                    is_other_company = False
+                    for other_comp in exact_headers.keys():
+                        if other_comp != comp and other_comp in para_text:
+                            is_other_company = True
                             break
+                    
+                    if is_other_company:
+                        app.logger.info(f"  Stopping at next company header: {para_text[:50]}")
+                        break
                 
-                # Include this paragraph as content (even if empty)
-                content_indices.append(i)
+                # This paragraph belongs to current role - mark for deletion
+                indices_to_delete.append(i)
                 if para_text:
-                    app.logger.info(f"  Including content at {i}: '{para_text[:60]}...'")
+                    app.logger.info(f"  Will delete at {i}: {para_text[:80]}")
                 
                 i += 1
             
-            # Delete all content for this role
-            if content_indices:
-                app.logger.info(f"Deleting {len(content_indices)} paragraphs for {comp}")
-                for idx in reversed(content_indices):
+            # Delete all marked paragraphs in reverse order
+            app.logger.info(f"Deleting {len(indices_to_delete)} paragraphs for {comp}")
+            for idx in reversed(indices_to_delete):
+                try:
                     p = base_doc.paragraphs[idx]._element
                     p.getparent().remove(p)
+                except Exception as e:
+                    app.logger.warning(f"Could not delete paragraph at {idx}: {e}")
+            
+            # Find the header again (indices have changed)
+            header_idx_new = None
+            for i, para in enumerate(base_doc.paragraphs):
+                if sanitize(para.text) == sanitize(header_text):
+                    header_idx_new = i
+                    break
+            
+            if header_idx_new is None:
+                app.logger.error(f"Could not re-find header for {comp}")
+                continue
             
             # Insert new bullets
+            last = base_doc.paragraphs[header_idx_new]
             new_bullets = bullets_by_company.get(comp, [])
-            last = base_doc.paragraphs[header_idx]
             
+            app.logger.info(f"Inserting {len(new_bullets)} new bullets for {comp}")
             for bullet in new_bullets:
                 bullet_text = sanitize(bullet)
                 if not bullet_text.startswith("•"):
@@ -826,8 +855,9 @@ def tailor():
                 new_para = insert_paragraph_after(last, bullet_text)
                 set_paragraph_font(new_para)
                 last = new_para
-            
-            app.logger.info(f"Inserted {len(new_bullets)} new bullets for {comp}")
+        
+        app.logger.info(f"\n{'='*60}")
+        app.logger.info(f"Bullet replacement complete")
     
     # MODIFICATION 4: Generate filename WITHOUT "Tailored"
     today = datetime.now().strftime("%Y-%m-%d")
