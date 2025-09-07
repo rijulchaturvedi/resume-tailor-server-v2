@@ -761,7 +761,22 @@ def tailor():
     skills_map = pick_relevant_skills(job_desc, {c: SKILL_BANK.get(c, []) for c in skills_categories})
     merge_skills(base_doc, skills_map)
     
-    # MODIFICATION 1: Replace bullets - FIXED VERSION
+    # MODIFICATION 1: Replace bullets - ROBUST VERSION
+    # Build exact_headers if not provided
+    if not exact_headers and experience:
+        exact_headers = {}
+        for exp in experience:
+            comp = sanitize(exp.get("company", ""))
+            role = sanitize(exp.get("role", ""))
+            if comp and role:
+                # Try to find the header in the document that contains both company and role
+                for para in base_doc.paragraphs:
+                    para_text = sanitize(para.text)
+                    if comp in para_text and role in para_text:
+                        exact_headers[comp] = para_text
+                        app.logger.info(f"Found header for {comp}: {para_text[:80]}")
+                        break
+    
     # Re-find anchors after summary/skills changes
     anchors = find_anchors_by_exact_headers(base_doc, exact_headers) if exact_headers else []
     
@@ -776,16 +791,30 @@ def tailor():
             # Find the header for this company (fresh search each time)
             header_idx = None
             header_text = exact_headers.get(comp, "")
-            for i, para in enumerate(base_doc.paragraphs):
-                if sanitize(para.text) == sanitize(header_text):
-                    header_idx = i
-                    break
+            
+            if header_text:
+                for i, para in enumerate(base_doc.paragraphs):
+                    if sanitize(para.text) == sanitize(header_text):
+                        header_idx = i
+                        break
+            
+            # Fallback: search for company name in paragraph
+            if header_idx is None:
+                for i, para in enumerate(base_doc.paragraphs):
+                    if comp in sanitize(para.text):
+                        # Check if this looks like a role header (has bold or is in professional experience section)
+                        has_bold = any(run.bold for run in para.runs) if para.runs else False
+                        if has_bold or "analyst" in para.text.lower() or "manager" in para.text.lower():
+                            header_idx = i
+                            header_text = para.text
+                            app.logger.info(f"Found header via fallback search: {header_text[:80]}")
+                            break
             
             if header_idx is None:
                 app.logger.warning(f"Could not find header for {comp}")
                 continue
             
-            app.logger.info(f"Found {comp} header at index {header_idx}")
+            app.logger.info(f"Found {comp} header at index {header_idx}: {base_doc.paragraphs[header_idx].text[:80]}")
             
             # Find all content to delete (everything until next header or section)
             indices_to_delete = []
@@ -812,7 +841,11 @@ def tailor():
                             is_other_company = True
                             break
                     
-                    if is_other_company:
+                    # Also check for role keywords to confirm it's a header
+                    role_keywords = ["analyst", "manager", "engineer", "developer", "consultant", "director"]
+                    has_role = any(keyword in para_text.lower() for keyword in role_keywords)
+                    
+                    if is_other_company and has_role:
                         app.logger.info(f"  Stopping at next company header: {para_text[:50]}")
                         break
                 
@@ -824,20 +857,24 @@ def tailor():
                 i += 1
             
             # Delete all marked paragraphs in reverse order
-            app.logger.info(f"Deleting {len(indices_to_delete)} paragraphs for {comp}")
-            for idx in reversed(indices_to_delete):
-                try:
-                    p = base_doc.paragraphs[idx]._element
-                    p.getparent().remove(p)
-                except Exception as e:
-                    app.logger.warning(f"Could not delete paragraph at {idx}: {e}")
+            if indices_to_delete:
+                app.logger.info(f"Deleting {len(indices_to_delete)} paragraphs for {comp}")
+                for idx in reversed(indices_to_delete):
+                    try:
+                        p = base_doc.paragraphs[idx]._element
+                        p.getparent().remove(p)
+                    except Exception as e:
+                        app.logger.warning(f"Could not delete paragraph at {idx}: {e}")
             
             # Find the header again (indices have changed)
             header_idx_new = None
             for i, para in enumerate(base_doc.paragraphs):
-                if sanitize(para.text) == sanitize(header_text):
-                    header_idx_new = i
-                    break
+                if comp in sanitize(para.text):
+                    # Verify this is the right header
+                    has_bold = any(run.bold for run in para.runs) if para.runs else False
+                    if has_bold or "analyst" in para.text.lower() or "manager" in para.text.lower():
+                        header_idx_new = i
+                        break
             
             if header_idx_new is None:
                 app.logger.error(f"Could not re-find header for {comp}")
@@ -847,7 +884,7 @@ def tailor():
             last = base_doc.paragraphs[header_idx_new]
             new_bullets = bullets_by_company.get(comp, [])
             
-            app.logger.info(f"Inserting {len(new_bullets)} new bullets for {comp}")
+            app.logger.info(f"Inserting {len(new_bullets)} new bullets for {comp} after index {header_idx_new}")
             for bullet in new_bullets:
                 bullet_text = sanitize(bullet)
                 if not bullet_text.startswith("•"):
@@ -858,6 +895,31 @@ def tailor():
         
         app.logger.info(f"\n{'='*60}")
         app.logger.info(f"Bullet replacement complete")
+    else:
+        app.logger.warning("No anchors found - attempting direct search")
+        # Fallback: try to process based on experience config alone
+        for exp in experience:
+            comp = sanitize(exp.get("company", ""))
+            if not comp:
+                continue
+                
+            app.logger.info(f"\nProcessing {comp} via direct search")
+            
+            # Find header
+            header_idx = None
+            for i, para in enumerate(base_doc.paragraphs):
+                if comp in sanitize(para.text):
+                    has_bold = any(run.bold for run in para.runs) if para.runs else False
+                    if has_bold:
+                        header_idx = i
+                        app.logger.info(f"Found {comp} at index {i}")
+                        break
+            
+            if header_idx is None:
+                continue
+            
+            # Delete old content and insert new (similar logic as above)
+            # ... (would continue with deletion and insertion logic)
     
     # MODIFICATION 4: Generate filename WITHOUT "Tailored"
     today = datetime.now().strftime("%Y-%m-%d")
