@@ -24,8 +24,8 @@ MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("OAI_THREADS", "2")))
 OAI_ENABLED = os.getenv("USE_OPENAI", "1").strip().lower() not in ("0", "false", "no")
-OAI_BUDGET = float(os.getenv("OAI_BUDGET", "20"))
-OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "20"))
+OAI_BUDGET = float(os.getenv("OAI_BUDGET", "60"))  # Increased timeout
+OAI_CLIENT_TIMEOUT = float(os.getenv("OAI_CLIENT_TIMEOUT", "45"))  # Increased timeout
 USE_RESPONSES_API = os.getenv("USE_RESPONSES_API", "0").strip().lower() in ("1","true","yes")
 
 def _env_bool(name: str, default: bool=False) -> bool:
@@ -495,23 +495,76 @@ def _gpt_call(client, system, prompt) -> str:
     return resp.choices[0].message.content.strip()
 
 def gpt(prompt: str, system: str = "You are a professional resume writer. Write in a natural, human style without AI markers.") -> str:
+    app.logger.info("=== GPT CALL START ===")
+    app.logger.info(f"System: {system[:100]}...")
+    app.logger.info(f"Prompt length: {len(prompt)} chars")
+    app.logger.info(f"Prompt preview: {prompt[:200]}...")
+    
     client = _get_client()
     if client is None:
+        app.logger.error("GPT CLIENT IS NONE - OpenAI disabled or key missing")
+        app.logger.error(f"OPENAI_API_KEY set: {bool(OPENAI_API_KEY)}")
+        app.logger.error(f"OAI_ENABLED: {OAI_ENABLED}")
+        app.logger.error(f"_openai_available: {_openai_available}")
         return "Placeholder output (model disabled or key missing)."
+    
     try:
+        app.logger.info(f"Sending request to OpenAI (timeout: {OAI_BUDGET}s)...")
         result = EXECUTOR.submit(_gpt_call, client, system, prompt).result(timeout=OAI_BUDGET)
-        return humanize_text(result)
+        app.logger.info(f"OpenAI response length: {len(result)} chars")
+        app.logger.info(f"OpenAI response preview: {result[:200]}...")
+        humanized = humanize_text(result)
+        app.logger.info("=== GPT CALL SUCCESS ===")
+        return humanized
+    except FuturesTimeout:
+        app.logger.error(f"OpenAI request timed out after {OAI_BUDGET} seconds")
+        return "Placeholder output due to timeout."
     except Exception as e:
-        app.logger.warning("OpenAI error: %s", e)
+        app.logger.error(f"OpenAI error: {type(e).__name__}: {e}")
+        app.logger.error("=== GPT CALL FAILED ===")
         return "Placeholder output due to model error."
+
+def extract_jd_keywords(jd: str, max_keywords: int = 8) -> List[str]:
+    """Extract key skills and technologies from job description"""
+    if not jd:
+        return []
+    
+    # Common technical and business keywords to look for
+    keyword_patterns = [
+        r'\b(?:Python|Java|SQL|JavaScript|React|Node\.js|AWS|Azure|Docker|Kubernetes)\b',
+        r'\b(?:Agile|Scrum|DevOps|CI/CD|ETL|API|REST|GraphQL|MongoDB|PostgreSQL)\b',
+        r'\b(?:machine learning|data analysis|business intelligence|project management)\b',
+        r'\b(?:stakeholder management|cross-functional|leadership|collaboration)\b',
+        r'\b(?:analytics|optimization|automation|integration|scalability)\b'
+    ]
+    
+    found_keywords = set()
+    jd_lower = jd.lower()
+    
+    for pattern in keyword_patterns:
+        matches = re.findall(pattern, jd_lower, re.IGNORECASE)
+        found_keywords.update(matches)
+    
+    # Also look for key nouns (simple approach)
+    important_nouns = ['team', 'product', 'system', 'platform', 'solution', 'process', 'strategy', 'performance']
+    for noun in important_nouns:
+        if noun in jd_lower:
+            found_keywords.add(noun)
+    
+    return list(found_keywords)[:max_keywords]
 
 # ----------------------------
 # Enhanced GPT Bullets Generation
 # ----------------------------
 def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str], metrics_by_company: Dict[str, List[str]]) -> Dict[str, List[str]]:
     """Generate humanized, quantified bullets - ENSURES EXACT COUNT"""
+    app.logger.info("=== BULLETS GENERATION START ===")
+    app.logger.info(f"Experience entries: {len(experience)}")
+    app.logger.info(f"JD length: {len(jd)} chars")
+    app.logger.info(f"JD preview: {jd[:300]}...")
+    
     entries = []
-    bullet_counts = {}  # Store requested counts
+    bullet_counts = {}
     
     for e in experience:
         k = int(e.get("bullets", 0) or 0)
@@ -519,50 +572,84 @@ def gpt_bullets_batch(experience: List[Dict], jd: str, style_rules: List[str], m
         comp = sanitize(e.get("company",""))
         role = sanitize(e.get("role",""))
         mx = metrics_by_company.get(comp, [])
-        bullet_counts[comp] = k  # Remember requested count
+        bullet_counts[comp] = k
         entries.append(f'- company: "{comp}"; role: "{role}"; bullets: {k}; metrics: [{", ".join(mx)}]')
+        app.logger.info(f"Will generate {k} bullets for {comp} ({role}) with {len(mx)} metrics")
     
     if not entries:
+        app.logger.warning("No experience entries to process")
         return {sanitize(e.get("company","")): [] for e in experience}
-    
+
+    # Extract key skills and requirements from job description
+    jd_keywords = extract_jd_keywords(jd)
+    app.logger.info(f"Extracted JD keywords: {jd_keywords}")
+
     # Enhanced style rules for human-like output
     rules_txt = "\n".join(f"- {r}" for r in (style_rules or [
         "20 to 28 words each bullet",
-        "Start with strong action verb in past tense",
-        "Include specific numbers and percentages naturally (use provided metrics)",
-        "Never use em/en dashes, use commas or 'by' instead",
-        "Write like a human, not AI (avoid overly formal language)",
+        "Start with strong action verb in past tense (Led, Developed, Implemented, Managed, etc.)",
+        "Include specific numbers and percentages naturally using provided metrics",
+        "Never use em/en dashes (—, –), use commas or connecting words like 'by', 'through', 'resulting in'",
+        "Write like a human, avoid AI buzzwords and formal corporate speak",
         "Focus on measurable business impact and outcomes",
-        "Use simple connecting words like 'and', 'by', 'through'",
-        "Each bullet must contain at least one quantified metric"
+        "Use simple connecting words: 'and', 'by', 'through', 'resulting in', 'leading to'",
+        "Each bullet must contain at least one quantified metric from the provided list",
+        "Tailor content to match job requirements and keywords"
     ]))
     
-    prompt = f"""Generate resume bullets that sound natural and human-written. Return ONLY valid JSON.
+    # More detailed prompt with explicit job description integration
+    prompt = f"""You are a professional resume writer helping tailor resume bullets to a specific job posting. 
 
-CRITICAL: 
-1. Write naturally without AI markers. Use numbers extensively. Replace dashes with commas or 'by'.
-2. YOU MUST PROVIDE EXACTLY THE NUMBER OF BULLETS SPECIFIED FOR EACH COMPANY. No more, no less.
-3. If you cannot think of enough unique bullets, create variations that highlight different aspects of the role.
+TARGET JOB REQUIREMENTS:
+{jd[:2000]}
 
-Entries (IMPORTANT: Generate EXACTLY the number of bullets specified):
+KEY SKILLS/KEYWORDS TO EMPHASIZE: {', '.join(jd_keywords)}
+
+RESUME ENTRIES TO GENERATE (generate EXACTLY the number of bullets specified):
 {chr(10).join(entries)}
 
-Style Rules:
+STYLE REQUIREMENTS:
 {rules_txt}
 
-Job Description Focus:
-{jd[:1500]}
+CRITICAL INSTRUCTIONS:
+1. You MUST provide EXACTLY the number of bullets specified for each company. No more, no less.
+2. Tailor each bullet to highlight skills/experience relevant to the job posting above
+3. Use the provided metrics naturally within each bullet - do not invent new numbers
+4. Write in a natural, human tone - avoid corporate buzzwords and AI-sounding language
+5. Each bullet should demonstrate value delivered and impact achieved
+6. Make bullets unique and specific to each role, not generic templates
 
-Return JSON with EXACTLY the specified number of bullets for each company:
+Return ONLY valid JSON in this exact format:
 {{
-  "Company Name": ["bullet 1", "bullet 2", "...exactly as many as specified"]
-}}"""
+  "Company Name": ["bullet 1 with metrics", "bullet 2 with metrics", "...exactly as many as specified"]
+}}
 
-    text = gpt(prompt, system="You are a professional resume writer. Generate human-sounding, quantified bullets. Return only valid JSON with EXACTLY the requested number of bullets for each company.")
+Example of good bullet style:
+"Led cross-functional team of 8 developers to implement new CRM system, reducing customer response time by 40% and increasing satisfaction scores by 25%"
+
+Generate the JSON now:"""
+
+    app.logger.info(f"Final prompt length: {len(prompt)} chars")
+    app.logger.info(f"JD keywords being emphasized: {jd_keywords}")
     
+    text = gpt(prompt, system="You are a professional resume writer. Generate natural, human-sounding bullets tailored to the job requirements. Return only valid JSON with EXACTLY the requested number of bullets.")
+    
+    app.logger.info(f"Raw GPT response: {text[:500]}...")
+    
+    # More robust JSON parsing
     try:
-        data = json.loads(text)
-    except Exception:
+        # Try to extract JSON from the response
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+            data = json.loads(json_str)
+            app.logger.info(f"Successfully parsed JSON with {len(data)} companies")
+        else:
+            app.logger.error("No JSON found in response")
+            data = {}
+    except Exception as e:
+        app.logger.error(f"JSON parsing failed: {e}")
+        app.logger.error(f"Raw text was: {text}")
         data = {}
     
     # Ensure exact bullet count for each company
@@ -585,19 +672,20 @@ Return JSON with EXACTLY the specified number of bullets for each company:
         else:
             # If we have fewer, generate fallback bullets to fill the gap
             bullets = gpt_bullets
-            fallback_templates = [
-                f"Enhanced operational efficiency by implementing data-driven solutions aligned with {e.get('role', 'role')} objectives",
-                f"Collaborated with stakeholders to deliver measurable improvements in key performance metrics",
-                f"Drove process improvements resulting in quantifiable business value and enhanced team productivity",
-                f"Managed complex initiatives that contributed to organizational goals and client satisfaction",
-                f"Developed innovative approaches to challenges, achieving significant cost savings and efficiency gains",
-                f"Led strategic projects that delivered substantial ROI and improved business outcomes"
+            # Enhanced fallback bullets that use JD keywords
+            jd_tailored_templates = [
+                f"Enhanced {jd_keywords[0] if jd_keywords else 'operational'} efficiency by implementing data-driven solutions",
+                f"Collaborated with stakeholders to deliver measurable improvements in {jd_keywords[1] if len(jd_keywords) > 1 else 'performance'} metrics",
+                f"Drove {jd_keywords[2] if len(jd_keywords) > 2 else 'process'} improvements resulting in quantifiable business value",
+                f"Managed complex initiatives focusing on {jd_keywords[0] if jd_keywords else 'strategic'} objectives and enhanced team productivity",
+                f"Led strategic projects that delivered substantial ROI and improved business outcomes",
+                f"Developed innovative approaches to challenges, achieving significant cost savings and efficiency gains"
             ]
             
             while len(bullets) < k:
                 # Add a fallback bullet (cycle through templates)
-                template_idx = (len(bullets) - len(gpt_bullets)) % len(fallback_templates)
-                fallback = fallback_templates[template_idx]
+                template_idx = (len(bullets) - len(gpt_bullets)) % len(jd_tailored_templates)
+                fallback = jd_tailored_templates[template_idx]
                 # Add some metrics if available
                 if metrics_by_company.get(comp):
                     metric = metrics_by_company[comp][len(bullets) % len(metrics_by_company[comp])]
@@ -613,11 +701,13 @@ Return JSON with EXACTLY the specified number of bullets for each company:
             final_bullets.append(b)
         
         out[comp] = final_bullets[:k]  # Ensure exactly k bullets
+        app.logger.info(f"Generated {len(out[comp])} bullets for {comp}")
         
         # Log if we had to adjust
         if len(gpt_bullets) != k:
             app.logger.warning(f"GPT returned {len(gpt_bullets)} bullets for {comp}, expected {k}. Adjusted to match.")
     
+    app.logger.info("=== BULLETS GENERATION COMPLETE ===")
     return out
 
 # ----------------------------
@@ -643,11 +733,62 @@ def extract_numeric_phrases(text: str, max_phrases: int = 15) -> List[str]:
     return found
 
 # ----------------------------
-# Main Route
+# Debug and Test Routes
+# ----------------------------
+@app.route("/debug")
+def debug():
+    return jsonify({
+        "openai_key_set": bool(OPENAI_API_KEY),
+        "openai_key_length": len(OPENAI_API_KEY) if OPENAI_API_KEY else 0,
+        "openai_available": _openai_available,
+        "oai_enabled": OAI_ENABLED,
+        "model": MODEL,
+        "budget": OAI_BUDGET,
+        "timeout": OAI_CLIENT_TIMEOUT,
+        "threads": os.getenv("OAI_THREADS", "2"),
+        "env_vars": {
+            "OPENAI_MODEL": os.getenv("OPENAI_MODEL"),
+            "USE_OPENAI": os.getenv("USE_OPENAI"),
+            "OAI_BUDGET": os.getenv("OAI_BUDGET"),
+            "OAI_CLIENT_TIMEOUT": os.getenv("OAI_CLIENT_TIMEOUT")
+        }
+    })
+
+@app.route("/test-openai")
+def test_openai():
+    try:
+        # Test basic GPT call
+        test_result = gpt("Write exactly one sentence about software engineering.", 
+                         "You are a helpful assistant.")
+        
+        # Test bullet generation with minimal data
+        test_exp = [{"company": "Test Corp", "role": "Test Role", "bullets": 2}]
+        test_jd = "We need a software engineer with Python experience."
+        test_metrics = {"Test Corp": ["50%", "$1M", "100 users"]}
+        
+        test_bullets = gpt_bullets_batch(test_exp, test_jd, [], test_metrics)
+        
+        return jsonify({
+            "success": True,
+            "test_summary": test_result,
+            "test_bullets": test_bullets,
+            "summary_is_placeholder": "placeholder" in test_result.lower(),
+            "bullets_is_placeholder": any("placeholder" in str(v).lower() for v in test_bullets.values())
+        })
+    
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__
+        })
+
+# ----------------------------
+# Main Routes
 # ----------------------------
 @app.route("/")
 def index():
-    return jsonify({"ok": True, "service": "resume-tailor-server", "endpoints": ["/health", "/tailor"]})
+    return jsonify({"ok": True, "service": "resume-tailor-server", "endpoints": ["/health", "/tailor", "/debug", "/test-openai"]})
 
 @app.route("/health")
 def health():
