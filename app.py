@@ -441,7 +441,7 @@ def parse_skills_section(doc: Document, s: int, e: int):
     return order, mapping
 
 def rewrite_skills_section(doc: Document, s: int, e: int, order: List[str], mapping: Dict[str, List[str]]):
-    """Rewrite skills section with proper bold headers and structured formatting"""
+    """Rewrite skills section with inline formatting (header and items on same line)"""
     if e >= s+1:
         delete_range(doc, s+1, e)
     
@@ -457,21 +457,22 @@ def rewrite_skills_section(doc: Document, s: int, e: int, order: List[str], mapp
         items = mapping.get(cat, [])
         
         if items:
-            # Create category header paragraph with bold formatting
-            header_text = f"{formatted_cat}:"
-            header_para = insert_paragraph_after(last, header_text)
-            set_paragraph_font(header_para)
+            # Create single paragraph with inline format
+            skills_para = insert_paragraph_after(last, "")  # Create empty paragraph first
+            set_paragraph_font(skills_para)
             
-            # Make the category header bold
-            for run in header_para.runs:
-                run.bold = True
+            # Add bold category header
+            header_run = skills_para.add_run(f"{formatted_cat}: ")
+            header_run.bold = True
+            header_run.font.name = "Times New Roman"
+            header_run.font.size = Pt(9)
             
-            # Create items paragraph
-            items_text = f"{', '.join(items)}"
-            items_para = insert_paragraph_after(header_para, items_text)
-            set_paragraph_font(items_para)
+            # Add regular text items
+            items_run = skills_para.add_run(', '.join(items))
+            items_run.font.name = "Times New Roman"
+            items_run.font.size = Pt(9)
             
-            last = items_para
+            last = skills_para
     
     # Add some spacing after skills section
     spacing_para = insert_paragraph_after(last, "")
